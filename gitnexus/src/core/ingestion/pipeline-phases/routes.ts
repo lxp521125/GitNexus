@@ -124,8 +124,32 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
         source: 'framework-route',
       });
     }
+
+    const classPrefixMap = new Map<string, string>();
     for (const dr of allDecoratorRoutes) {
-      addRoute(ensureSlash(dr.routePath), {
+      if (dr.isClassLevel && dr.httpMethod === 'CLASS' && dr.enclosingClass) {
+        const key = `${dr.filePath}::${dr.enclosingClass}`;
+        const existing = classPrefixMap.get(key);
+        if (!existing || existing === '') {
+          classPrefixMap.set(key, dr.routePath);
+        }
+      }
+    }
+
+    for (const dr of allDecoratorRoutes) {
+      if (dr.isClassLevel) continue;
+
+      let fullPath = ensureSlash(dr.routePath);
+      if (dr.enclosingClass) {
+        const prefix = classPrefixMap.get(`${dr.filePath}::${dr.enclosingClass}`);
+        if (prefix) {
+          const normalizedPrefix = ensureSlash(prefix).replace(/\/+$/, '');
+          fullPath = normalizedPrefix + fullPath;
+          fullPath = fullPath.replace(/\/+/g, '/');
+        }
+      }
+
+      addRoute(fullPath, {
         filePath: dr.filePath,
         source: `decorator-${dr.decoratorName}`,
       });

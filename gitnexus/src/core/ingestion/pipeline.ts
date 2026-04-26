@@ -18,6 +18,7 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { type PipelineProgress } from 'gitnexus-shared';
 import { PipelineResult } from '../../types/pipeline.js';
+import { PluginHooks } from '../plugins/plugin-hooks.js';
 import {
   runPipeline,
   getPhaseOutput,
@@ -98,6 +99,9 @@ export const runPipelineFromRepo = async (
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
+  // 执行管道前的插件钩子
+  await PluginHooks.beforePipeline(repoPath);
+  
   const graph = createKnowledgeGraph();
   const pipelineStart = Date.now();
 
@@ -139,7 +143,7 @@ export const runPipelineFromRepo = async (
     },
   });
 
-  return {
+  const result = {
     graph,
     repoPath,
     totalFileCount: totalFiles,
@@ -147,4 +151,9 @@ export const runPipelineFromRepo = async (
     processResult,
     usedWorkerPool,
   };
+  
+  // 执行管道后的插件钩子
+  await PluginHooks.afterPipeline(repoPath, result);
+  
+  return result;
 };

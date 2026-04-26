@@ -207,6 +207,8 @@ export interface ExtractedDecoratorRoute {
   httpMethod: string;
   decoratorName: string;
   lineNumber: number;
+  isClassLevel?: boolean;
+  enclosingClass?: string;
 }
 
 export interface ExtractedToolDef {
@@ -913,10 +915,55 @@ const ROUTE_DECORATOR_NAMES = new Set([
   'PostMapping',
   'PutMapping',
   'DeleteMapping',
+  'PatchMapping',
+  'RestController',
+  'Controller',
+  'Path',
 ]);
 
 const RESOURCE_ACTIONS = ['index', 'create', 'store', 'show', 'edit', 'update', 'destroy'];
 const API_RESOURCE_ACTIONS = ['index', 'store', 'show', 'update', 'destroy'];
+
+const JAXRS_METHOD_ANNOTATIONS = new Set([
+  'GET',
+  'POST',
+  'PUT',
+  'DELETE',
+  'HEAD',
+  'OPTIONS',
+  'PATCH',
+]);
+
+function findSiblingPathAnnotation(node: SyntaxNode): string | undefined {
+  const parent = node.parent;
+  if (!parent) return undefined;
+  const container = parent.type === 'modifiers' ? parent : parent.parent;
+  if (!container) return undefined;
+  const targetContainer = container.type === 'modifiers' ? container : parent;
+  for (let i = 0; i < targetContainer.namedChildCount; i++) {
+    const child = targetContainer.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'annotation') {
+      const nameNode = child.childForFieldName?.('name') ?? child.firstNamedChild;
+      if (nameNode?.text === 'Path') {
+        const argsNode = child.childForFieldName?.('arguments');
+        if (argsNode) {
+          for (let j = 0; j < argsNode.namedChildCount; j++) {
+            const arg = argsNode.namedChild(j);
+            if (arg?.type === 'string_literal') {
+              const fragment = arg.childForFieldName?.('value') ?? arg.firstNamedChild;
+              if (fragment) return fragment.text;
+            }
+          }
+        }
+      }
+    } else if (child.type === 'marker_annotation') {
+      const nameNode = child.childForFieldName?.('name') ?? child.firstNamedChild;
+      if (nameNode?.text === 'Path') return '';
+    }
+  }
+  return undefined;
+}
 
 /** Check if node is a scoped_call_expression with object 'Route' */
 function isRouteStaticCall(node: SyntaxNode): boolean {
@@ -1571,7 +1618,8 @@ const processFileGroup = (
       // Store decorator metadata for later association with definitions
       if (captureMap['decorator'] && captureMap['decorator.name']) {
         const decoratorName = captureMap['decorator.name'].text;
-        const decoratorArg = captureMap['decorator.arg']?.text;
+        const decoratorArg =
+          captureMap['decorator.arg']?.text || captureMap['decorator.arg.named']?.text;
         const decoratorNode = captureMap['decorator'];
         // Store by the decorator's end line — the definition follows immediately after
         fileDecorators.set(decoratorNode.endPosition.row, {
@@ -1581,16 +1629,73 @@ const processFileGroup = (
 
         if (ROUTE_DECORATOR_NAMES.has(decoratorName)) {
           const routePath = decoratorArg || '';
-          const method = decoratorName.replace('Mapping', '').toUpperCase();
-          const httpMethod = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)
-            ? method
-            : 'GET';
+          let httpMethod: string;
+
+          if (decoratorName === 'RequestMapping') {
+            httpMethod = 'ALL';
+          } else if (decoratorName === 'Path') {
+            httpMethod = 'ALL';
+          } else if (decoratorName === 'RestController' || decoratorName === 'Controller') {
+            httpMethod = 'CLASS';
+          } else {
+            const method = decoratorName.replace('Mapping', '').toUpperCase();
+            httpMethod = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)
+              ? method
+              : 'GET';
+          }
+
+          const parentNode = decoratorNode.parent;
+          const isClassLevel =
+            parentNode?.type === 'class_declaration' ||
+            (parentNode?.type === 'modifiers' &&
+              parentNode?.parent?.type === 'class_declaration') ||
+            (parentNode?.type === 'class_body' &&
+              parentNode?.parent?.type === 'class_declaration');
+
+          if (isClassLevel && (decoratorName === 'RequestMapping' || decoratorName === 'Path')) {
+            httpMethod = 'CLASS';
+          }
+
+          let enclosingClass: string | undefined;
+          if (isClassLevel) {
+            const classNode =
+              parentNode?.type === 'class_declaration'
+                ? parentNode
+                : parentNode?.type === 'modifiers'
+                  ? parentNode?.parent
+                  : parentNode?.parent?.parent;
+            const nameNode = classNode?.childForFieldName?.('name') ?? classNode?.firstNamedChild;
+            if (nameNode && nameNode.type === 'identifier') {
+              enclosingClass = nameNode.text;
+            }
+          } else {
+            const classInfo = findEnclosingClassInfo(decoratorNode, file.path);
+            enclosingClass = classInfo?.className;
+          }
+
           result.decoratorRoutes.push({
             filePath: file.path,
             routePath,
             httpMethod,
             decoratorName,
             lineNumber: decoratorNode.startPosition.row + lineOffset,
+            ...(isClassLevel ? { isClassLevel: true } : {}),
+            ...(enclosingClass ? { enclosingClass } : {}),
+          });
+        }
+        // JAX-RS method annotations: @GET, @POST, @PUT, @DELETE, @HEAD, @OPTIONS, @PATCH
+        // These marker annotations have no path argument — the path comes from @Path
+        if (JAXRS_METHOD_ANNOTATIONS.has(decoratorName)) {
+          const methodPath = findSiblingPathAnnotation(decoratorNode);
+          const classInfo = findEnclosingClassInfo(decoratorNode, file.path);
+          const httpMethod = decoratorName.toUpperCase();
+          result.decoratorRoutes.push({
+            filePath: file.path,
+            routePath: methodPath ?? '',
+            httpMethod,
+            decoratorName,
+            lineNumber: decoratorNode.startPosition.row + lineOffset,
+            ...(classInfo?.className ? { enclosingClass: classInfo.className } : {}),
           });
         }
         // MCP/RPC tool detection: @mcp.tool(), @app.tool(), @server.tool()

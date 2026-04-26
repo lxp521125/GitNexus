@@ -182,6 +182,12 @@ const LABEL_BEHAVIOR = {
   Section: 'inert',
   Route: 'inert',
   Tool: 'inert',
+  // Spring Boot / Enterprise Java node types
+  Bean: 'inert',
+  ConfigProperty: 'inert',
+  KafkaTopic: 'inert',
+  KafkaConsumer: 'inert',
+  KafkaProducer: 'inert',
 } as const satisfies Record<NodeLabel, LabelBehavior> &
   // Cross-invariant 1 — every class-like label (participates in
   // qualifiedName fallback in `SymbolTable.add()`) MUST be classified as

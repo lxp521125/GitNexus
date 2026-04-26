@@ -428,6 +428,21 @@ export const JAVA_QUERIES = `
     object: (_) @assignment.receiver
     field: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Spring Boot / JAX-RS annotation captures ─────────────────────────
+; Marker annotation (no arguments): @RestController, @Controller, @Override
+(marker_annotation name: (identifier) @decorator.name) @decorator
+
+; Annotation with arguments: @GetMapping("/users"), @RequestMapping("/api")
+(annotation
+  name: (identifier) @decorator.name
+  arguments: (annotation_argument_list
+    [
+      (string_literal (string_fragment) @decorator.arg)
+      (element_value_pair
+        key: (identifier) @_decorator.arg.key
+        value: (string_literal (string_fragment) @decorator.arg.named))
+    ])) @decorator
 `;
 
 // C queries - works with tree-sitter-c
@@ -1048,6 +1063,29 @@ export const KOTLIN_QUERIES = `
       (simple_identifier) @assignment.property))
   (_)) @assignment
 
+; ── Spring Boot annotation captures ──────────────────────────────────
+; Kotlin annotations appear inside modifiers nodes.
+; Annotation without arguments: @RestController, @Controller
+(modifiers
+  (annotation
+    (user_type (type_identifier) @decorator.name))) @decorator
+
+; Annotation with string argument: @GetMapping("/users"), @RequestMapping("/api")
+(modifiers
+  (annotation
+    (user_type (type_identifier) @decorator.name)
+    (annotation_arguments
+      (value_argument
+        (string_literal (string_content) @decorator.arg))?))) @decorator
+
+; Annotation with named argument: @RequestMapping(value = "/api", method = [GET])
+(modifiers
+  (annotation
+    (user_type (type_identifier) @decorator.name)
+    (annotation_arguments
+      (value_argument
+        (simple_identifier) @_decorator.arg.key
+        (string_literal (string_content) @decorator.arg.named))?))) @decorator
 `;
 
 // Swift queries - works with tree-sitter-swift

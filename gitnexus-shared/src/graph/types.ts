@@ -44,7 +44,13 @@ export type NodeLabel =
   | 'Template'
   | 'Section'
   | 'Route'
-  | 'Tool';
+  | 'Tool'
+  // Spring Boot / Enterprise Java node types
+  | 'Bean'
+  | 'ConfigProperty'
+  | 'KafkaTopic'
+  | 'KafkaConsumer'
+  | 'KafkaProducer';
 
 export type NodeProperties = {
   name: string;
@@ -72,6 +78,8 @@ export type NodeProperties = {
   entryPointReason?: string;
   // Method/property
   parameterCount?: number;
+  parameterTypes?: string[];
+  throwsTypes?: string[];
   level?: number;
   returnType?: string;
   declaredType?: string;
@@ -84,11 +92,67 @@ export type NodeProperties = {
   isOverride?: boolean;
   isAsync?: boolean;
   isPartial?: boolean;
+  isAsyncExecution?: boolean;
   annotations?: string[];
   // Route/response
   responseKeys?: string[];
   errorKeys?: string[];
   middleware?: string[];
+  // Spring Boot / Enterprise Java properties
+  beanName?: string;
+  beanType?: 'component' | 'service' | 'repository' | 'controller' | 'restController' | 'configuration' | 'beanMethod';
+  beanScope?: 'singleton' | 'prototype' | 'request' | 'session' | 'application' | 'websocket';
+  isPrimary?: boolean;
+  isLazy?: boolean;
+  qualifier?: string;
+  conditionalOn?: string[];
+  injectionType?: 'constructor' | 'field' | 'setter' | 'method';
+  // Transaction properties
+  transactional?: {
+    propagation?: string;
+    isolation?: string;
+    rollbackFor?: string[];
+    noRollbackFor?: string[];
+    readOnly?: boolean;
+  };
+  // AOP properties
+  adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
+  pointcutExpression?: string;
+  // Cache properties
+  cache?: {
+    operation?: 'cacheable' | 'cacheEvict' | 'cachePut';
+    cacheNames?: string[];
+    key?: string;
+    condition?: string;
+  };
+  // Scheduled properties
+  scheduled?: {
+    cron?: string;
+    fixedRate?: number;
+    fixedDelay?: number;
+    initialDelay?: number;
+  };
+  // Security properties
+  security?: {
+    type?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
+    expression?: string;
+    roles?: string[];
+  };
+  // Kafka properties
+  kafkaTopic?: string;
+  kafkaGroupId?: string;
+  kafkaBootstrapServers?: string;
+  // Config property
+  configKey?: string;
+  configType?: 'yaml' | 'properties';
+  defaultValue?: string;
+  prefix?: string;
+  // Generic type info
+  typeParameters?: string[];
+  typeParameterBounds?: string[][];
+  genericArgs?: string[];
+  entityType?: string;
+  repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
   // Extensible
   [key: string]: unknown;
 };
@@ -115,7 +179,19 @@ export type RelationshipType =
   | 'HANDLES_TOOL'
   | 'ENTRY_POINT_OF'
   | 'WRAPS'
-  | 'QUERIES';
+  | 'QUERIES'
+  // Spring Boot / Enterprise Java relationships
+  | 'INJECTS_INTO'
+  | 'BINDS_TO'
+  | 'MANAGES'
+  | 'ADVISES'
+  | 'TRANSACTIONS'
+  | 'SECURES'
+  | 'PUBLISHES'
+  | 'SUBSCRIBES_TO'
+  | 'CONSUMES_FROM'
+  | 'PRODUCES_TO'
+  | 'HAS_BEAN';
 
 export interface GraphNode {
   id: string;
@@ -131,17 +207,30 @@ export interface GraphRelationship {
   confidence: number;
   reason: string;
   step?: number;
-  /**
-   * Per-signal evidence trace for edges emitted by the scope-based
-   * resolution pipeline (RFC #909 Ring 2 PKG #925). Populated by
-   * `emit-references.ts` when draining `ReferenceIndex` into the graph
-   * so downstream query / audit tools can inspect *why* a given edge
-   * was emitted with its confidence value.
-   *
-   * Optional and additive — every existing edge emitter ignores this
-   * field, and every existing query continues to work whether or not
-   * an edge carries it.
-   */
+  properties?: {
+    injectionType?: 'constructor' | 'field' | 'setter' | 'method';
+    qualifier?: string;
+    isRequired?: boolean;
+    bindingType?: 'configurationProperties' | 'valueInjection';
+    prefix?: string;
+    adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
+    pointcutExpression?: string;
+    propagation?: string;
+    isolation?: string;
+    rollbackFor?: string[];
+    readOnly?: boolean;
+    securityType?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
+    expression?: string;
+    roles?: string[];
+    eventType?: string;
+    isAsync?: boolean;
+    listenerType?: 'eventListener' | 'transactionalEventListener' | 'kafkaListener' | 'rabbitListener' | 'jmsListener';
+    phase?: string;
+    order?: number;
+    destination?: string;
+    group?: string;
+    repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
+  };
   evidence?: readonly {
     readonly kind: string;
     readonly weight: number;

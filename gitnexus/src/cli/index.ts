@@ -193,4 +193,10 @@ program
 
 registerGroupCommands(program);
 
+// Plugin management commands
+program
+  .command('plugin')
+  .description('Manage GitNexus plugins')
+  .action(createLazyAction(() => import('./plugin.js'), 'pluginCommand'));
+
 program.parse(process.argv);
