@@ -256,6 +256,14 @@ export interface FileConstructorBindings {
  *       just `FILE_SCOPE` if the sequential path needs function-scope data too.
  *    6. Consider renaming this interface back to `FileAllScopeBindings`
  *       along with widening. */
+/** Config reference from @Value annotation: links a field to a config path */
+export interface ExtractedConfigReference {
+  filePath: string;
+  fieldName: string;
+  configPath: string;
+  lineNumber: number;
+}
+
 export interface FileScopeBindings {
   filePath: string;
   /** [varName, typeName] pairs from the file scope only. */
@@ -278,6 +286,8 @@ export interface ParseWorkerResult {
   constructorBindings: FileConstructorBindings[];
   /** All-scope type bindings from TypeEnv for BindingAccumulator (includes function-local). */
   fileScopeBindings: FileScopeBindings[];
+  /** Config references from @Value annotations: field → config path mappings */
+  configReferences: ExtractedConfigReference[];
   /**
    * Per-file `ParsedFile` artifacts from the new scope-based resolution
    * pipeline (RFC #909 Ring 2). Empty unless the file's provider implements
@@ -744,6 +754,7 @@ const processBatch = (
     ormQueries: [],
     constructorBindings: [],
     fileScopeBindings: [],
+    configReferences: [],
     parsedFiles: [],
     skippedLanguages: {},
     fileCount: 0,
@@ -1556,7 +1567,7 @@ const processFileGroup = (
     }
 
     // Per-file map: decorator end-line → decorator info, for associating with definitions
-    const fileDecorators = new Map<number, { name: string; arg?: string; isTool?: boolean }>();
+    const fileDecorators = new Map<number, { name: string; arg?: string; isTool?: boolean; configPath?: string }>();
 
     // Track start indices of definition nodes already processed by higher-priority captures
     // (e.g. @definition.function) to avoid duplicate nodes when @definition.const/@definition.variable
@@ -1706,6 +1717,20 @@ const processFileGroup = (
             arg: decoratorArg,
             isTool: true,
           });
+        }
+        // Spring @Value annotation processing: @Value("${config.path}")
+        if (decoratorName === 'Value') {
+          // Extract config path from @Value("${config.path}")
+          const configPathMatch = decoratorArg?.match(/\$\{([^}]+)\}/);
+          if (configPathMatch) {
+            const configPath = configPathMatch[1];
+            // Store with configPath for later association with field definition
+            fileDecorators.set(decoratorNode.endPosition.row, {
+              name: decoratorName,
+              arg: decoratorArg,
+              configPath,
+            });
+          }
         }
         continue;
       }
@@ -2254,6 +2279,15 @@ const processFileGroup = (
                 lineNumber: definitionNode.startPosition.row + lineOffset,
               });
             }
+            // Handle @Value annotation with config path
+            if (dec.configPath) {
+              result.configReferences.push({
+                filePath: file.path,
+                fieldName: nodeName,
+                configPath: dec.configPath,
+                lineNumber: definitionNode.startPosition.row + lineOffset,
+              });
+            }
             fileDecorators.delete(checkLine);
           }
         }
@@ -2430,6 +2464,7 @@ let accumulated: ParseWorkerResult = {
   decoratorRoutes: [],
   toolDefs: [],
   ormQueries: [],
+  configReferences: [],
   constructorBindings: [],
   fileScopeBindings: [],
   parsedFiles: [],
@@ -2510,6 +2545,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         decoratorRoutes: [],
         toolDefs: [],
         ormQueries: [],
+        configReferences: [],
         constructorBindings: [],
         fileScopeBindings: [],
         parsedFiles: [],

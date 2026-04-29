@@ -443,6 +443,12 @@ export const JAVA_QUERIES = `
         key: (identifier) @_decorator.arg.key
         value: (string_literal (string_fragment) @decorator.arg.named))
     ])) @decorator
+
+; Spring @Value annotation: @Value("\${config.path}")
+(annotation
+  name: (identifier) @value_annotation.name
+  arguments: (annotation_argument_list
+    (string_literal (string_fragment) @value_annotation.arg))) @value_annotation
 `;
 
 // C queries - works with tree-sitter-c

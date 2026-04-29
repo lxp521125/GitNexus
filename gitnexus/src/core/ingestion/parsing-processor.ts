@@ -47,6 +47,7 @@ import type {
   FileConstructorBindings,
   FileScopeBindings,
   ExtractedORMQuery,
+  ExtractedConfigReference,
 } from './workers/parse-worker.js';
 import {
   getTreeSitterBufferSize,
@@ -66,6 +67,7 @@ export interface WorkerExtractedData {
   decoratorRoutes: ExtractedDecoratorRoute[];
   toolDefs: ExtractedToolDef[];
   ormQueries: ExtractedORMQuery[];
+  configReferences: ExtractedConfigReference[];
   constructorBindings: FileConstructorBindings[];
   fileScopeBindings: FileScopeBindings[];
   /**
@@ -108,6 +110,7 @@ const processParsingWithWorkers = async (
       decoratorRoutes: [],
       toolDefs: [],
       ormQueries: [],
+      configReferences: [],
       constructorBindings: [],
       fileScopeBindings: [],
       parsedFiles: [],
@@ -133,6 +136,7 @@ const processParsingWithWorkers = async (
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
+  const allConfigReferences: ExtractedConfigReference[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
   const fileScopeBindingsByFile: FileScopeBindings[] = [];
   const allParsedFiles: ParsedFile[] = [];
@@ -170,6 +174,7 @@ const processParsingWithWorkers = async (
     for (const item of result.decoratorRoutes) allDecoratorRoutes.push(item);
     for (const item of result.toolDefs) allToolDefs.push(item);
     if (result.ormQueries) for (const item of result.ormQueries) allORMQueries.push(item);
+    if (result.configReferences) for (const item of result.configReferences) allConfigReferences.push(item);
     for (const item of result.constructorBindings) allConstructorBindings.push(item);
     if (result.fileScopeBindings)
       for (const item of result.fileScopeBindings) fileScopeBindingsByFile.push(item);
@@ -206,6 +211,7 @@ const processParsingWithWorkers = async (
     decoratorRoutes: allDecoratorRoutes,
     toolDefs: allToolDefs,
     ormQueries: allORMQueries,
+    configReferences: allConfigReferences,
     constructorBindings: allConstructorBindings,
     fileScopeBindings: fileScopeBindingsByFile,
     parsedFiles: allParsedFiles,
