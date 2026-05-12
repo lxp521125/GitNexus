@@ -22,4 +22,6 @@ export enum SupportedLanguages {
   Vue = 'vue',
   /** Standalone regex processor — no tree-sitter, no LanguageProvider. */
   Cobol = 'cobol',
+  /** YAML configuration files — standalone processor via js-yaml. */
+  Yaml = 'yaml',
 }
