@@ -6,6 +6,7 @@ export type {
   GraphNode,
   GraphRelationship,
 } from './graph/types.js';
+export { createNode, createEdge } from './graph/types.js';
 
 // Schema constants
 export {
@@ -183,3 +184,16 @@ export {
   stripGitSuffix,
 } from './integrations/understand-quickly.js';
 export type { UqDispatchPayload } from './integrations/understand-quickly.js';
+
+// ─── Plugin SDK types ──────────────────────────────────────────────────────
+export type {
+  Plugin,
+  ParserPlugin,
+  AnalyzerPlugin,
+  ParserRegistry,
+  AnalyzerRegistry,
+  ParseResult,
+  AnalysisResult,
+  AnalysisResultItem,
+  AnalysisContext,
+} from './plugins/index.js';

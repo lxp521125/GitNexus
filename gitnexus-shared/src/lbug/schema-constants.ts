@@ -42,6 +42,12 @@ export const NODE_TABLES = [
   'Tool',
   // Taint/PDG substrate (issue #2080) — inert until M1 (#2081) emits blocks.
   'BasicBlock',
+  // Spring Boot / Enterprise Java node types
+  'Bean',
+  'ConfigProperty',
+  'KafkaTopic',
+  'KafkaConsumer',
+  'KafkaProducer',
 ] as const;
 
 export type NodeTableName = (typeof NODE_TABLES)[number];
@@ -77,6 +83,18 @@ export const REL_TYPES = [
   'TAINTED',
   'SANITIZES',
   'TAINT_PATH',
+  // Spring Boot / Enterprise Java relationships
+  'INJECTS_INTO',
+  'BINDS_TO',
+  'MANAGES',
+  'ADVISES',
+  'TRANSACTIONS',
+  'SECURES',
+  'PUBLISHES',
+  'SUBSCRIBES_TO',
+  'CONSUMES_FROM',
+  'PRODUCES_TO',
+  'HAS_BEAN',
 ] as const;
 
 export type RelType = (typeof REL_TYPES)[number];

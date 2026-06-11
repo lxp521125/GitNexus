@@ -2,7 +2,7 @@
  * Phase: parse
  *
  * Chunked parse + resolve loop: reads source in byte-budget chunks,
- * parses via the worker pool (the sole parse path — no sequential fallback),
+ * parses via the worker pool (the sole parse path 闁?no sequential fallback),
  * resolves imports, heritage, and calls, synthesizes wildcard bindings.
  *
  * This phase encapsulates the entire `runChunkedParseAndResolve` function
@@ -39,7 +39,7 @@ export interface ParseOutput {
    * Fully populated by `parse` on the main thread after the worker parse:
    * `enrichExportedTypeMap` propagates fixpoint-inferred TypeEnv bindings and
    * `buildExportedTypeMapFromGraph` reconstructs from graph nodes.
-   * Downstream phases — including `crossFile` — receive it as a true
+   * Downstream phases 闁?including `crossFile` 闁?receive it as a true
    * `ReadonlyMap`; `crossFile` builds its own mutable working copy locally
    * for per-file re-resolution writes, so this snapshot is never mutated
    * after parse returns.
@@ -52,7 +52,7 @@ export interface ParseOutput {
   readonly allToolDefs: readonly ExtractedToolDef[];
   readonly allORMQueries: readonly ExtractedORMQuery[];
   bindingAccumulator: BindingAccumulator;
-  /** SemanticModel populated during parse — scope-resolution reads its
+  /** SemanticModel populated during parse 闁?scope-resolution reads its
    *  TypeRegistry / MethodRegistry / SymbolTable indexes. */
   model: MutableSemanticModel;
   /** Pass-through: all file paths for downstream phases. */
@@ -63,7 +63,7 @@ export interface ParseOutput {
   totalFiles: number;
   /**
    * True if the parse phase constructed a worker pool for this run. False
-   * means no pool was needed — a warm all-cache-hit run replays cached worker
+   * means no pool was needed 闁?a warm all-cache-hit run replays cached worker
    * output without spawning workers, or there were no parseable files. There
    * is no sequential parser; the pool is the sole parse path on a cache miss.
    */
@@ -77,6 +77,8 @@ export interface ParseOutput {
    * costing ~58s on a 1000-file repo).
    */
   readonly parsedFiles: readonly ParsedFile[];
+  /** Extracted configuration references (Spring @Value annotations, etc.). */
+  readonly configReferences: readonly { filePath: string; fieldName: string; configPath: string }[];
 }
 
 export const parsePhase: PipelinePhase<ParseOutput> = {
@@ -108,6 +110,7 @@ export const parsePhase: PipelinePhase<ParseOutput> = {
       allPaths,
       allPathSet,
       totalFiles,
+      configReferences: [],
     };
   },
 };

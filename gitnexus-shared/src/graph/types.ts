@@ -47,7 +47,33 @@ export type NodeLabel =
   | 'Tool'
   // Taint/PDG substrate (issue #2080). Intra-procedural control-flow node.
   // Emitted by no phase yet — M1 (#2081) populates these behind an opt-in.
-  | 'BasicBlock';
+  | 'BasicBlock'
+  // Spring Boot / Enterprise Java node types
+  | 'Bean'
+  | 'ConfigProperty'
+  | 'KafkaTopic'
+  | 'KafkaConsumer'
+  | 'KafkaProducer'
+  // Plugin-extensible node types
+  | 'KafkaConfig'
+  | 'KafkaTopics'
+  | 'JpaEntity'
+  | 'JpaRepository'
+  | 'JpaField'
+  | 'MyBatisMapper'
+  | 'MyBatisXmlMapper'
+  | 'MyBatisSql'
+  | 'MyBatisMethod'
+  // Markdown node types
+  | 'MarkdownDoc'
+  | 'MarkdownHeading'
+  | 'CodeBlock'
+  | 'Link'
+  | 'Image'
+  | 'Todo'
+  | 'Table'
+  | 'Blockquote'
+  | 'List';
 
 export type NodeProperties = {
   name: string;
@@ -94,6 +120,68 @@ export type NodeProperties = {
   middleware?: string[];
   // BasicBlock (taint/PDG substrate, issue #2080) — reuses filePath/startLine/endLine.
   text?: string;
+  // Spring Boot / Enterprise Java properties
+  beanName?: string;
+  beanType?:
+    | 'component'
+    | 'service'
+    | 'repository'
+    | 'controller'
+    | 'restController'
+    | 'configuration'
+    | 'beanMethod';
+  beanScope?: 'singleton' | 'prototype' | 'request' | 'session' | 'application' | 'websocket';
+  isPrimary?: boolean;
+  isLazy?: boolean;
+  qualifier?: string;
+  conditionalOn?: string[];
+  injectionType?: 'constructor' | 'field' | 'setter' | 'method';
+  // Transaction properties
+  transactional?: {
+    propagation?: string;
+    isolation?: string;
+    rollbackFor?: string[];
+    noRollbackFor?: string[];
+    readOnly?: boolean;
+  };
+  // AOP properties
+  adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
+  pointcutExpression?: string;
+  // Cache properties
+  cache?: {
+    operation?: 'cacheable' | 'cacheEvict' | 'cachePut';
+    cacheNames?: string[];
+    key?: string;
+    condition?: string;
+  };
+  // Scheduled properties
+  scheduled?: {
+    cron?: string;
+    fixedRate?: number;
+    fixedDelay?: number;
+    initialDelay?: number;
+  };
+  // Security properties
+  security?: {
+    type?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
+    expression?: string;
+    roles?: string[];
+  };
+  // Kafka properties
+  kafkaTopic?: string;
+  kafkaGroupId?: string;
+  kafkaBootstrapServers?: string;
+  // Config property
+  configKey?: string;
+  configType?: 'yaml' | 'properties';
+  defaultValue?: string;
+  prefix?: string;
+  // Generic type info
+  typeParameters?: string[];
+  typeParameterBounds?: string[][];
+  genericArgs?: string[];
+  entityType?: string;
+  repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
   // Extensible
   [key: string]: unknown;
 };
@@ -157,7 +245,32 @@ export type RelationshipType =
   | 'SANITIZES'
   /** Materialized source→sink taint path. Working name — final name/representation
    *  is confirmed when M3/M4 emits it; no persisted edge exists before then. */
-  | 'TAINT_PATH';
+  | 'TAINT_PATH'
+  // Spring Boot / Enterprise Java relationships
+  | 'INJECTS_INTO'
+  | 'BINDS_TO'
+  | 'MANAGES'
+  | 'ADVISES'
+  | 'TRANSACTIONS'
+  | 'SECURES'
+  | 'PUBLISHES'
+  | 'SUBSCRIBES_TO'
+  | 'CONSUMES_FROM'
+  | 'PRODUCES_TO'
+  | 'HAS_BEAN'
+  // Plugin-extensible relationship types
+  | 'HAS_CONFIG'
+  | 'HAS_SQL'
+  // Markdown relationship types
+  | 'HAS_HEADING'
+  | 'HAS_CODE_BLOCK'
+  | 'LINKS_TO'
+  | 'HAS_IMAGE'
+  | 'HAS_TODO'
+  | 'HAS_TABLE'
+  | 'HAS_BLOCKQUOTE'
+  | 'HAS_LIST'
+  | 'HAS_SECTION';
 
 export interface GraphNode {
   id: string;
@@ -189,4 +302,68 @@ export interface GraphRelationship {
     readonly weight: number;
     readonly note?: string;
   }[];
+  properties?: {
+    injectionType?: 'constructor' | 'field' | 'setter' | 'method';
+    qualifier?: string;
+    isRequired?: boolean;
+    bindingType?: 'configurationProperties' | 'valueInjection';
+    prefix?: string;
+    adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
+    pointcutExpression?: string;
+    propagation?: string;
+    isolation?: string;
+    rollbackFor?: string[];
+    readOnly?: boolean;
+    securityType?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
+    expression?: string;
+    roles?: string[];
+    eventType?: string;
+    isAsync?: boolean;
+    listenerType?:
+      | 'eventListener'
+      | 'transactionalEventListener'
+      | 'kafkaListener'
+      | 'rabbitListener'
+      | 'jmsListener';
+    phase?: string;
+    order?: number;
+    destination?: string;
+    group?: string;
+    repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
+  };
+}
+
+/**
+ * Create a GraphNode with auto-generated id.
+ */
+export function createNode(label: NodeLabel, properties: NodeProperties): GraphNode {
+  const id = `${label.toLowerCase()}:${properties.name || 'unknown'}@${properties.filePath || 'unknown'}`;
+  return { id, label, properties };
+}
+
+/**
+ * Create a GraphRelationship with auto-generated id.
+ */
+export function createEdge(
+  type: RelationshipType,
+  sourceId: string,
+  targetId: string,
+  extra?: {
+    confidence?: number;
+    reason?: string;
+    step?: number;
+    properties?: Record<string, unknown>;
+  },
+): GraphRelationship {
+  const id = `${sourceId}-${type}-${targetId}`;
+  return {
+    id,
+    sourceId,
+    targetId,
+    type,
+    confidence: extra?.confidence ?? 1.0,
+    reason: extra?.reason ?? '',
+    step: extra?.step,
+    properties: extra?.properties as GraphRelationship['properties'],
+  };
 }
