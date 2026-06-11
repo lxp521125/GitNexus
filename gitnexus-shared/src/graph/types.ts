@@ -45,32 +45,9 @@ export type NodeLabel =
   | 'Section'
   | 'Route'
   | 'Tool'
-  // Spring Boot / Enterprise Java node types
-  | 'Bean'
-  | 'ConfigProperty'
-  | 'KafkaTopic'
-  | 'KafkaConsumer'
-  | 'KafkaProducer'
-  // Plugin-extensible node types
-  | 'KafkaConfig'
-  | 'KafkaTopics'
-  | 'JpaEntity'
-  | 'JpaRepository'
-  | 'JpaField'
-  | 'MyBatisMapper'
-  | 'MyBatisXmlMapper'
-  | 'MyBatisSql'
-  | 'MyBatisMethod'
-  // Markdown node types
-  | 'MarkdownDoc'
-  | 'MarkdownHeading'
-  | 'CodeBlock'
-  | 'Link'
-  | 'Image'
-  | 'Todo'
-  | 'Table'
-  | 'Blockquote'
-  | 'List';
+  // Taint/PDG substrate (issue #2080). Intra-procedural control-flow node.
+  // Emitted by no phase yet — M1 (#2081) populates these behind an opt-in.
+  | 'BasicBlock';
 
 export type NodeProperties = {
   name: string;
@@ -98,8 +75,6 @@ export type NodeProperties = {
   entryPointReason?: string;
   // Method/property
   parameterCount?: number;
-  parameterTypes?: string[];
-  throwsTypes?: string[];
   level?: number;
   returnType?: string;
   declaredType?: string;
@@ -112,74 +87,13 @@ export type NodeProperties = {
   isOverride?: boolean;
   isAsync?: boolean;
   isPartial?: boolean;
-  isAsyncExecution?: boolean;
   annotations?: string[];
   // Route/response
   responseKeys?: string[];
   errorKeys?: string[];
   middleware?: string[];
-  // Spring Boot / Enterprise Java properties
-  beanName?: string;
-  beanType?:
-    | 'component'
-    | 'service'
-    | 'repository'
-    | 'controller'
-    | 'restController'
-    | 'configuration'
-    | 'beanMethod';
-  beanScope?: 'singleton' | 'prototype' | 'request' | 'session' | 'application' | 'websocket';
-  isPrimary?: boolean;
-  isLazy?: boolean;
-  qualifier?: string;
-  conditionalOn?: string[];
-  injectionType?: 'constructor' | 'field' | 'setter' | 'method';
-  // Transaction properties
-  transactional?: {
-    propagation?: string;
-    isolation?: string;
-    rollbackFor?: string[];
-    noRollbackFor?: string[];
-    readOnly?: boolean;
-  };
-  // AOP properties
-  adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
-  pointcutExpression?: string;
-  // Cache properties
-  cache?: {
-    operation?: 'cacheable' | 'cacheEvict' | 'cachePut';
-    cacheNames?: string[];
-    key?: string;
-    condition?: string;
-  };
-  // Scheduled properties
-  scheduled?: {
-    cron?: string;
-    fixedRate?: number;
-    fixedDelay?: number;
-    initialDelay?: number;
-  };
-  // Security properties
-  security?: {
-    type?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
-    expression?: string;
-    roles?: string[];
-  };
-  // Kafka properties
-  kafkaTopic?: string;
-  kafkaGroupId?: string;
-  kafkaBootstrapServers?: string;
-  // Config property
-  configKey?: string;
-  configType?: 'yaml' | 'properties';
-  defaultValue?: string;
-  prefix?: string;
-  // Generic type info
-  typeParameters?: string[];
-  typeParameterBounds?: string[][];
-  genericArgs?: string[];
-  entityType?: string;
-  repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
+  // BasicBlock (taint/PDG substrate, issue #2080) — reuses filePath/startLine/endLine.
+  text?: string;
   // Extensible
   [key: string]: unknown;
 };
@@ -207,31 +121,43 @@ export type RelationshipType =
   | 'ENTRY_POINT_OF'
   | 'WRAPS'
   | 'QUERIES'
-  // Spring Boot / Enterprise Java relationships
-  | 'INJECTS_INTO'
-  | 'BINDS_TO'
-  | 'MANAGES'
-  | 'ADVISES'
-  | 'TRANSACTIONS'
-  | 'SECURES'
-  | 'PUBLISHES'
-  | 'SUBSCRIBES_TO'
-  | 'CONSUMES_FROM'
-  | 'PRODUCES_TO'
-  | 'HAS_BEAN'
-  // Plugin-extensible relationship types
-  | 'HAS_CONFIG'
-  | 'HAS_SQL'
-  // Markdown relationship types
-  | 'HAS_HEADING'
-  | 'HAS_CODE_BLOCK'
-  | 'LINKS_TO'
-  | 'HAS_IMAGE'
-  | 'HAS_TODO'
-  | 'HAS_TABLE'
-  | 'HAS_BLOCKQUOTE'
-  | 'HAS_LIST'
-  | 'HAS_SECTION';
+  /** Vue component event system: a handler function in a parent component is
+   *  bound to an event emitted by a child component (`@event="handlerFn"`).
+   *  Source = handler Function/Method node in the parent.
+   *  Target = the child component's File node.
+   *  `reason` encodes the event name: `vue-event: @<eventName>`.
+   *  Complements `EMITS_EVENT`; together they enable Cypher queries that
+   *  trace which handlers receive which component's emitted events. */
+  | 'BINDS_EVENT_HANDLER'
+  /** Vue component event system: a component calls `emit('eventName', ...)`
+   *  or `this.$emit('eventName', ...)`, advertising that it can emit that event.
+   *  Source = the component's own File node (self-referential annotation).
+   *  Target = the same File node.
+   *  `reason` encodes the event name: `vue-emit: <eventName>`.
+   *  Complements `BINDS_EVENT_HANDLER`; a Cypher query joining on the
+   *  component File node reveals all (emitter, handler) pairs. */
+  | 'EMITS_EVENT'
+  // ── Taint/PDG substrate (issue #2080) ────────────────────────────────────
+  // Reserved edge types for the taint-first PDG substrate. No phase emits any
+  // of these yet; they are populated behind an opt-in by later milestones
+  // (CFG → M1 #2081, REACHING_DEF → M2 #2082, TAINTED/SANITIZES/TAINT_PATH →
+  // M3/M4 #2083/#2084). Adding them here keeps the shared schema stable so
+  // downstream work does not re-ripple the exhaustiveness sites.
+  /** Control-flow edge between two BasicBlock nodes (intra-procedural CFG). */
+  | 'CFG'
+  /** Data-dependence edge: a definition of `variable` reaches a use of it.
+   *  The `variable` name is stored in the relation's existing `reason` column
+   *  (M0/S1 verdict: LadybugDB has no secondary index on relationship
+   *  properties, so a dedicated indexed column would not speed the
+   *  variable-filtered path query). */
+  | 'REACHING_DEF'
+  /** A tainted value flows from source toward sink. */
+  | 'TAINTED'
+  /** A sanitizer clears taint along a flow. */
+  | 'SANITIZES'
+  /** Materialized source→sink taint path. Working name — final name/representation
+   *  is confirmed when M3/M4 emits it; no persisted edge exists before then. */
+  | 'TAINT_PATH';
 
 export interface GraphNode {
   id: string;
@@ -247,73 +173,20 @@ export interface GraphRelationship {
   confidence: number;
   reason: string;
   step?: number;
-  properties?: {
-    injectionType?: 'constructor' | 'field' | 'setter' | 'method';
-    qualifier?: string;
-    isRequired?: boolean;
-    bindingType?: 'configurationProperties' | 'valueInjection';
-    prefix?: string;
-    adviceType?: 'before' | 'after' | 'around' | 'afterReturning' | 'afterThrowing';
-    pointcutExpression?: string;
-    propagation?: string;
-    isolation?: string;
-    rollbackFor?: string[];
-    readOnly?: boolean;
-    securityType?: 'preAuthorize' | 'secured' | 'rolesAllowed' | 'filterChain';
-    expression?: string;
-    roles?: string[];
-    eventType?: string;
-    isAsync?: boolean;
-    listenerType?:
-      | 'eventListener'
-      | 'transactionalEventListener'
-      | 'kafkaListener'
-      | 'rabbitListener'
-      | 'jmsListener';
-    phase?: string;
-    order?: number;
-    destination?: string;
-    group?: string;
-    repositoryType?: 'jpa' | 'mongo' | 'redis' | 'elasticsearch';
-  };
+  /**
+   * Per-signal evidence trace for edges emitted by the scope-based
+   * resolution pipeline (RFC #909 Ring 2 PKG #925). Populated by
+   * `emit-references.ts` when draining `ReferenceIndex` into the graph
+   * so downstream query / audit tools can inspect *why* a given edge
+   * was emitted with its confidence value.
+   *
+   * Optional and additive — every existing edge emitter ignores this
+   * field, and every existing query continues to work whether or not
+   * an edge carries it.
+   */
   evidence?: readonly {
     readonly kind: string;
     readonly weight: number;
     readonly note?: string;
   }[];
-}
-
-/**
- * Create a GraphNode with auto-generated id.
- */
-export function createNode(label: NodeLabel, properties: NodeProperties): GraphNode {
-  const id = `${label.toLowerCase()}:${properties.name || 'unknown'}@${properties.filePath || 'unknown'}`;
-  return { id, label, properties };
-}
-
-/**
- * Create a GraphRelationship with auto-generated id.
- */
-export function createEdge(
-  type: RelationshipType,
-  sourceId: string,
-  targetId: string,
-  extra?: {
-    confidence?: number;
-    reason?: string;
-    step?: number;
-    properties?: Record<string, unknown>;
-  },
-): GraphRelationship {
-  const id = `${sourceId}-${type}-${targetId}`;
-  return {
-    id,
-    sourceId,
-    targetId,
-    type,
-    confidence: extra?.confidence ?? 1.0,
-    reason: extra?.reason ?? '',
-    step: extra?.step,
-    properties: extra?.properties as GraphRelationship['properties'],
-  };
 }

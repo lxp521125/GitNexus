@@ -20,7 +20,7 @@ const CLONE_ROOT = path.resolve(path.join(os.homedir(), '.gitnexus', 'repos'));
 // Rejecting anything else (including `..`, `/`, `\`, shell metacharacters)
 // guarantees getCloneDir(repoName) cannot escape CLONE_ROOT regardless of
 // how the caller derived repoName.
-const REPO_NAME_PATTERN = /^[a-zA-Z0-9._-]+$/;
+export const REPO_NAME_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 /**
  * Extract the repository name from a git URL (HTTPS or SSH).
@@ -304,6 +304,7 @@ export function getRemoteOriginUrl(cwd: string): Promise<string | null> {
     const proc = spawn('git', ['config', '--get', 'remote.origin.url'], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     });
     let stdout = '';
@@ -427,6 +428,7 @@ function runGit(args: string[], cwd?: string): Promise<void> {
     const proc = spawn('git', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
       env: {
         ...process.env,
         // Prevent git from prompting for credentials (hangs the process)

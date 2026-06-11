@@ -40,12 +40,8 @@ export const NODE_TABLES = [
   'Module',
   'Route',
   'Tool',
-  // Spring Boot / Enterprise Java node types
-  'Bean',
-  'ConfigProperty',
-  'KafkaTopic',
-  'KafkaConsumer',
-  'KafkaProducer',
+  // Taint/PDG substrate (issue #2080) — inert until M1 (#2081) emits blocks.
+  'BasicBlock',
 ] as const;
 
 export type NodeTableName = (typeof NODE_TABLES)[number];
@@ -73,18 +69,14 @@ export const REL_TYPES = [
   'ENTRY_POINT_OF',
   'WRAPS',
   'QUERIES',
-  // Spring Boot / Enterprise Java relationships
-  'INJECTS_INTO',
-  'BINDS_TO',
-  'MANAGES',
-  'ADVISES',
-  'TRANSACTIONS',
-  'SECURES',
-  'PUBLISHES',
-  'SUBSCRIBES_TO',
-  'CONSUMES_FROM',
-  'PRODUCES_TO',
-  'HAS_BEAN',
+  // Taint/PDG substrate (issue #2080) — reserved edge types, emitted by no
+  // phase yet (CFG → M1, REACHING_DEF → M2, TAINTED/SANITIZES/TAINT_PATH →
+  // M3/M4). REACHING_DEF's variable name rides the relation's `reason` column.
+  'CFG',
+  'REACHING_DEF',
+  'TAINTED',
+  'SANITIZES',
+  'TAINT_PATH',
 ] as const;
 
 export type RelType = (typeof REL_TYPES)[number];

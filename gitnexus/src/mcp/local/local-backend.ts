@@ -8,25 +8,36 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { createHash } from 'crypto';
 import {
   initLbug,
   executeQuery,
   executeParameterized,
   closeLbug,
   isLbugReady,
-  isWriteQuery,
 } from '../../core/lbug/pool-adapter.js';
+import { isValidQueryParams } from '../../core/lbug/query-params.js';
 import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
-export { isWriteQuery };
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
-import { parseDiffHunks, type FileDiff } from '../../storage/git.js';
+import {
+  parseDiffHunks,
+  getCanonicalRepoRoot,
+  getGitRoot,
+  type FileDiff,
+} from '../../storage/git.js';
+import { realpathSync } from 'fs';
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  canonicalizePath,
+  getStoragePaths,
+  loadMeta,
+  RegistryAmbiguousTargetError,
   type RegistryEntry,
+  type BranchSummary,
 } from '../../storage/repo-manager.js';
 import { GroupService, type GroupToolPort } from '../../core/group/service.js';
 import { resolveAtGroupMemberRepoPath } from '../../core/group/resolve-at-member.js';
@@ -43,6 +54,7 @@ import {
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
+import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from '../tools.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -116,12 +128,33 @@ export const VALID_RELATION_TYPES = new Set([
   'OVERRIDES', // Legacy alias — dual-read for pre-rename indexes
   'METHOD_IMPLEMENTS',
   'ACCESSES',
+  // Emitted by emit-references.ts / scope-resolution/graph-bridge/edges.ts and
+  // already part of the default impact relTypes + context() incoming queries.
+  // It was missing from this allowlist, so `impact({relationTypes:['USES']})`
+  // silently filtered to [] and fell back to the full default traversal
+  // (#2129/#1858 review F5). No IMPACT_RELATION_CONFIDENCE floor → 0.5 fallback,
+  // matching the FETCHES / WRAPS / HANDLES_ROUTE precedent below.
+  'USES',
   'HANDLES_ROUTE',
   'FETCHES',
   'HANDLES_TOOL',
   'ENTRY_POINT_OF',
   'WRAPS',
 ]);
+
+/**
+ * Relation types the #1858 epistemic-boundary probe keys on. Kept as
+ * module-level `readonly` arrays (not Sets) because computeEpistemicBoundary
+ * binds them as Cypher query params (`r.type IN $heritage` / `IN $types`).
+ * The heritage set is exactly the IMPACT_RELATION_CONFIDENCE 0.85 tier —
+ * "statically verifiable, but the concrete binding past it is not".
+ */
+export const EPISTEMIC_HERITAGE_RELATION_TYPES: readonly string[] = [
+  'IMPLEMENTS',
+  'METHOD_IMPLEMENTS',
+  'EXTENDS',
+];
+export const EPISTEMIC_CONSUMER_RELATION_TYPES: readonly string[] = ['CALLS', 'USES', 'ACCESSES'];
 
 /**
  * Per-relation-type confidence floor for impact analysis.
@@ -170,6 +203,35 @@ function logQueryError(context: string, err: unknown): void {
 }
 
 /**
+ * A "missing table/label/relation" prepare error is benign for the query tool's
+ * best-effort enrichment: a repo analyzed without processes or communities simply
+ * has no `Process`/`Community` tables, so the `STEP_IN_PROCESS` / `MEMBER_OF`
+ * enrichment queries fail to prepare. That is a normal configuration, NOT a
+ * degraded result — it must not raise the `partial` flag (which callers would
+ * then learn to ignore). Real failures (timeouts, locks, native faults) do.
+ */
+function isBenignMissingTableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /does not exist|no such (table|label|rel)|unknown (table|label)|not (defined|found)/i.test(
+    msg,
+  );
+}
+
+const isReadOnlyDbError = (err: unknown): boolean => {
+  // Walk the `cause` chain (bounded) so a wrapped read-only error (e.g. the
+  // pool adapter's `{ cause }` wrapper) is still detected here — this is the
+  // copy the MCP cypher handler uses to surface its curated read-only message
+  // (#2068 follow-up). Mirrors lbug-adapter's isReadOnlyDbError.
+  let cur: unknown = err;
+  for (let depth = 0; depth < 5 && cur != null; depth++) {
+    const msg = cur instanceof Error ? cur.message : String(cur);
+    if (/read-only database/i.test(msg)) return true;
+    cur = cur instanceof Error ? (cur as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+};
+
+/**
  * Per-query latency telemetry for production aggregation (#553).
  *
  * Logged at `debug` level — timing is observability/telemetry, not an
@@ -209,6 +271,197 @@ interface RepoHandle {
   lastCommit: string;
   remoteUrl?: string;
   stats?: RegistryEntry['stats'];
+  /** Primary/flat branch name, when known (#2106). */
+  branch?: string;
+  /** Non-primary branch indexes available for this repo (#2106). */
+  branches?: BranchSummary[];
+}
+
+/** Resolve symlinks for path comparison; falls back to path.resolve on error.
+ * Uses `realpathSync.native` (not the pure-JS `realpathSync`) so that Windows
+ * 8.3 short names (e.g. RUNNER~1 → runneradmin) are expanded to long form,
+ * matching the output of `git rev-parse --show-toplevel`. */
+function tryRealpath(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Resolve the git diff cwd for detect_changes, auto-detecting linked worktrees.
+ *
+ * When `launchCwd` is a linked worktree of the same canonical repository as
+ * `repoPath` (i.e. `getGitRoot(launchCwd)` differs from `repoPath` but both
+ * share the same `getCanonicalRepoRoot`), returns the worktree's git root so
+ * that `git diff` sees the correct working directory and index.
+ *
+ * Returns `repoPath` unchanged in all other cases (non-worktree, git
+ * unavailable, unrelated repo).
+ *
+ * Extracted as a module-level export so tests can pass any `launchCwd` instead
+ * of relying on `process.cwd()`, which is fixed to the server launch directory
+ * and cannot be changed mid-process.
+ */
+export function resolveWorktreeCwd(repoPath: string, launchCwd: string): string {
+  try {
+    // Verify repoPath is a git root before comparing against its canonical
+    // root. If getGitRoot returns a different path, repoPath is an arbitrary
+    // subdirectory — skip both the linked-worktree guard and auto-detection
+    // and fall through to the repoPath fallback.
+    const repoGitRoot = getGitRoot(repoPath);
+    const repoCanonical =
+      repoGitRoot && tryRealpath(repoGitRoot) === tryRealpath(repoPath)
+        ? getCanonicalRepoRoot(repoPath)
+        : null;
+
+    // Early exit: if repoPath is a linked worktree (differs from its canonical
+    // main-checkout root), return it unchanged. Do NOT override it with the
+    // server's launch directory — that would silently replace the explicitly-
+    // resolved worktree index with the main checkout.
+    //
+    // getCanonicalRepoRoot returns the main-checkout path for both the checkout
+    // and all linked worktrees:
+    //   repoPath === canonical → main checkout (auto-detect may fire below)
+    //   repoPath !== canonical → linked worktree (return as-is)
+    if (repoCanonical && tryRealpath(repoPath) !== tryRealpath(repoCanonical)) {
+      return repoPath;
+    }
+
+    const launchGitRoot = getGitRoot(launchCwd);
+    if (launchGitRoot) {
+      // Normalise via realpathSync before comparing so macOS /var → /private/var
+      // symlinks (and Windows 8.3 short names) don't create false mismatches.
+      const realLaunch = tryRealpath(launchGitRoot);
+      const realRepo = tryRealpath(repoPath);
+      if (realLaunch !== realRepo) {
+        const launchCanonical = getCanonicalRepoRoot(launchCwd);
+        // Use tryRealpath on both canonical values for cross-platform safety.
+        if (
+          launchCanonical &&
+          repoCanonical &&
+          tryRealpath(launchCanonical) === tryRealpath(repoCanonical)
+        ) {
+          return launchGitRoot;
+        }
+      }
+    }
+  } catch {
+    // Best-effort; fall through to repoPath.
+  }
+  return repoPath;
+}
+
+/**
+ * Length of the path-derived suffix appended to a colliding repo id.
+ * Exported so tests can pin the suffix shape without re-deriving the
+ * literal; see `assignRepoId()` and the hashed-id resolution tier (#1658).
+ *
+ * Note: base64url is an *encoding*, not a hash — it preserves byte order, so
+ * two paths that share a long common prefix (sibling clones under one parent)
+ * collapse to the same sliced suffix. `assignRepoId()` keeps the legacy
+ * base64url suffix only for the first colliding duplicate (id compatibility)
+ * and falls back to a content hash of the resolved path on a real collision
+ * (#2054).
+ */
+export const REPO_ID_HASH_LENGTH = 6;
+
+interface ImpactParams {
+  target: string;
+  target_uid?: string;
+  file_path?: string;
+  kind?: string;
+  direction: 'upstream' | 'downstream';
+  maxDepth?: number;
+  relationTypes?: string[];
+  includeTests?: boolean;
+  minConfidence?: number;
+  limit?: number;
+  offset?: number;
+  summaryOnly?: boolean;
+}
+
+/**
+ * One repository entry as returned by {@link LocalBackend.listRepos} and in each
+ * `list_repos` page. Named so the `listRepos`/`listReposPage` return types read
+ * clearly instead of an opaque `Awaited<ReturnType<…>>` expression.
+ */
+export interface RepoListing {
+  name: string;
+  path: string;
+  indexedAt: string;
+  lastCommit: string;
+  remoteUrl?: string;
+  stats?: any;
+  staleness?: { commitsBehind: number; hint?: string };
+  siblings?: Array<{ name: string; path: string; lastCommit: string }>;
+  /** Primary/flat branch name, when known (#2106). */
+  branch?: string;
+  /** Non-primary branch indexes available for this repo (#2106). */
+  branches?: Array<Omit<BranchSummary, 'stats'>>;
+}
+
+/** Continuation metadata for the paginated `list_repos` MCP tool (#2119). */
+export interface ListReposPagination {
+  /** Total repositories across all pages. */
+  total: number;
+  /** Effective page size used (equals the requested limit; out-of-range is rejected, not clamped). */
+  limit: number;
+  /** Offset this page started at. */
+  offset: number;
+  /** Number of repositories actually returned in this page. */
+  returned: number;
+  /** True when more repositories remain past this page. */
+  hasMore: boolean;
+  /** Offset to request next; present only when `hasMore` is true. */
+  nextOffset?: number;
+}
+
+/**
+ * Validate and normalise `list_repos` pagination arguments.
+ *
+ * @internal Exported for unit testing; not part of the public API surface.
+ *
+ * There is NO MCP-SDK-level enforcement of a tool's advertised `inputSchema`
+ * (the SDK validates only the JSON-RPC envelope), and `callTool` is reachable
+ * directly, so the backend is the real validation boundary. Malformed values —
+ * non-number, `NaN`, non-integer, `limit < 1`, `limit > maxLimit`, or
+ * `offset < 0` — are REJECTED with a clear error. `limit` is bounded but NOT
+ * silently clamped: an over-max value throws (symmetric with the other bounds)
+ * so a client never receives a smaller page than it asked for without knowing.
+ * An omitted value (only `undefined`) falls back to the default.
+ */
+export function parseListReposPagination(
+  params: { limit?: unknown; offset?: unknown } | null | undefined,
+  opts: { defaultLimit: number; maxLimit: number },
+): { limit: number; offset: number } {
+  const requireInt = (value: unknown, field: string, min: number, max?: number): number => {
+    const valid =
+      typeof value === 'number' &&
+      Number.isInteger(value) &&
+      value >= min &&
+      (max === undefined || value <= max);
+    if (!valid) {
+      const bound = max === undefined ? `>= ${min}` : `between ${min} and ${max}`;
+      throw new Error(
+        `list_repos: "${field}" must be an integer ${bound} (received ${JSON.stringify(value)})`,
+      );
+    }
+    return value;
+  };
+
+  let limit = opts.defaultLimit;
+  if (params?.limit !== undefined) {
+    limit = requireInt(params.limit, 'limit', 1, opts.maxLimit);
+  }
+
+  let offset = 0;
+  if (params?.offset !== undefined) {
+    offset = requireInt(params.offset, 'offset', 0);
+  }
+
+  return { limit, offset };
 }
 
 export class LocalBackend {
@@ -217,6 +470,12 @@ export class LocalBackend {
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
+  // Last meta.indexedAt observed for an open pool, keyed by lbugPath. Keyed by
+  // pool (not stored on the handle) because branch handles are produced fresh
+  // by applyBranchScope on every resolveRepo call, so mutating the handle would
+  // not persist across calls and the staleness check would reinit forever
+  // (#2106).
+  private lastObservedIndexedAt: Map<string, string> = new Map();
   private groupToolSvc: GroupService | null = null;
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
@@ -274,11 +533,35 @@ export class LocalBackend {
    */
   private async refreshRepos(): Promise<void> {
     const entries = await listRegisteredRepos({ validate: true });
-    const freshIds = new Set<string>();
 
-    for (const entry of entries) {
-      const id = this.repoId(entry.name, entry.path);
-      freshIds.add(id);
+    // Build the next map from scratch and swap it in atomically. Mutating the
+    // live map in place let stale entries influence fresh id assignment: a
+    // bare-name id, once handed to the first registry entry, stuck to it across
+    // refreshes and reorders, and colliding path suffixes silently overwrote
+    // each other so sibling clones disappeared from `list_repos` (#2054).
+    const nextRepos = new Map<string, RepoHandle>();
+    const nextContext = new Map<string, CodebaseContext>();
+    const assigned = new Map<string, string>(); // id -> resolved repo path
+
+    // Assign ids over a path-sorted view so a registered clone always gets the
+    // same id regardless of the registry's on-disk order: the bare name and
+    // each path-derived suffix become a pure function of the resolved-path set,
+    // not of iteration order, so a memorized id can't drift to a different
+    // clone after a registry reorder (#2067 follow-up).
+    const ordered = [...entries].sort((a, b) => {
+      const ra = path.resolve(a.path);
+      const rb = path.resolve(b.path);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
+
+    for (const entry of ordered) {
+      // path.resolve (not canonicalizePath) matches the pre-#2054 collision
+      // check and keeps refreshRepos free of mockable deps on the hot init
+      // path. registerRepo writes path.resolve'd paths (not realpath), and
+      // resolveRepoFromCache canonicalizes both sides when matching by path, so
+      // keying id assignment on path.resolve here is consistent and correct.
+      const resolved = path.resolve(entry.path);
+      const id = this.assignRepoId(entry.name, entry.path, resolved, assigned);
 
       const storagePath = entry.storagePath;
       const lbugPath = path.join(storagePath, 'lbug');
@@ -302,13 +585,15 @@ export class LocalBackend {
         lastCommit: entry.lastCommit,
         remoteUrl: entry.remoteUrl,
         stats: entry.stats,
+        branch: entry.branch,
+        branches: entry.branches,
       };
 
-      this.repos.set(id, handle);
+      nextRepos.set(id, handle);
 
       // Build lightweight context (no LadybugDB needed)
       const s = entry.stats || {};
-      this.contextCache.set(id, {
+      nextContext.set(id, {
         projectName: entry.name,
         stats: {
           fileCount: s.files || 0,
@@ -319,31 +604,105 @@ export class LocalBackend {
       });
     }
 
-    // Prune repos that no longer exist in the registry
-    for (const id of this.repos.keys()) {
-      if (!freshIds.has(id)) {
-        this.repos.delete(id);
-        this.contextCache.delete(id);
-        this.initializedRepos.delete(id);
+    // Prune per-clone pool state for databases that are no longer registered.
+    // The LadybugDB pool and the init/staleness/reinit maps are keyed by the
+    // immutable lbugPath (see ensureInitialized), so a repo id that merely
+    // moves to a different clone needs NO eviction — distinct clones have
+    // distinct lbugPaths and can never share a pool entry, which is what closes
+    // the resolve→query wrong-clone window for good (#2067). Only a path that
+    // dropped out of the registry must release its pooled connection + state.
+    const liveLbugPaths = new Set([...nextRepos.values()].map((h) => h.lbugPath));
+    // Branch pools (opened on demand by applyBranchScope) are NOT in this.repos
+    // — branch handles are minted fresh and discarded — so add every registered
+    // branch's lbugPath to the live set. Pure string work over the already-in-
+    // memory registry snapshot; no disk I/O on this hot path (#2106 R3).
+    for (const entry of entries) {
+      for (const b of entry.branches ?? []) {
+        liveLbugPaths.add(getStoragePaths(entry.path, b.branch).lbugPath);
       }
     }
+    // initializedRepos is the authoritative set of OPENED pool keys (flat AND
+    // branch); union it with the previously-known flat handles so an orphaned
+    // branch pool (e.g. after `clean --branch` removes its summary) is closed
+    // and forgotten too, not just flat handles.
+    const knownKeys = new Set<string>([
+      ...[...this.repos.values()].map((h) => h.lbugPath),
+      ...this.initializedRepos,
+    ]);
+    for (const key of knownKeys) {
+      if (liveLbugPaths.has(key)) continue;
+      this.initializedRepos.delete(key);
+      this.lastStalenessCheck.delete(key);
+      this.lastObservedIndexedAt.delete(key);
+      this.reinitPromises.delete(key);
+      closeLbug(key).catch(() => {});
+    }
+
+    this.repos = nextRepos;
+    this.contextCache = nextContext;
   }
 
   /**
-   * Generate a stable repo ID from name + path.
-   * If names collide, append a hash of the path.
+   * Assign a collision-free in-memory id for a registered repo.
+   *
+   * - Unique name → the bare lowercased name.
+   * - Duplicate name → a path-derived suffix. The *first* colliding clone keeps
+   *   the legacy `base64url(path)` suffix so ids generated before #2054 still
+   *   resolve (the #1658 hashed-id tier). base64url is an encoding, not a hash:
+   *   it preserves byte order, so sibling clones under one parent (e.g.
+   *   `.../REPO_2` and `.../REPO_3`) yield identical leading characters and thus
+   *   the same sliced suffix. Any further collision therefore falls back to a
+   *   content hash of the *resolved* path (order-insensitive), extended
+   *   deterministically until unique.
+   *
+   * `assigned` maps every id handed out in this refresh to its resolved path,
+   * so a candidate is "free" when it is unused or already owned by this exact
+   * path. This method records its own assignment into `assigned` before
+   * returning, so the map-update is the function's invariant, not a caller
+   * obligation. A returned id never overwrites a different path's handle (#2054).
    */
-  private repoId(name: string, repoPath: string): string {
+  private assignRepoId(
+    name: string,
+    repoPath: string,
+    resolved: string,
+    assigned: Map<string, string>,
+  ): string {
     const base = name.toLowerCase();
-    // Check for name collision with a different path
-    for (const [id, handle] of this.repos) {
-      if (id === base && handle.repoPath !== path.resolve(repoPath)) {
-        // Collision — use path hash
-        const hash = Buffer.from(repoPath).toString('base64url').slice(0, 6);
-        return `${base}-${hash}`;
-      }
+    const free = (id: string): boolean => {
+      const owner = assigned.get(id);
+      return owner === undefined || owner === resolved;
+    };
+    // Record the assignment so subsequent entries in the same refresh see this
+    // id as taken (the function owns its own invariant).
+    const claim = (id: string): string => {
+      assigned.set(id, resolved);
+      return id;
+    };
+
+    if (free(base)) return claim(base);
+
+    // Legacy suffix from the *raw* path — kept byte-for-byte so the first
+    // colliding duplicate keeps the id it had before #2054 (#1658 tier).
+    const legacy = `${base}-${Buffer.from(repoPath)
+      .toString('base64url')
+      .slice(0, REPO_ID_HASH_LENGTH)
+      .toLowerCase()}`;
+    if (free(legacy)) return claim(legacy);
+
+    // Real collision — hash the resolved path. Lowercase hex survives the
+    // `paramLower` lookup in resolveRepoFromCache.
+    const digest = createHash('sha256').update(resolved).digest('hex');
+    for (let len = REPO_ID_HASH_LENGTH; len <= digest.length; len++) {
+      const candidate = `${base}-${digest.slice(0, len)}`;
+      if (free(candidate)) return claim(candidate);
     }
-    return base;
+
+    // Two distinct resolved paths sharing a full SHA-256 digest is a hash
+    // break, not a runtime condition — fail loudly rather than silently
+    // overwrite a different repo's handle (#2054 invariant).
+    throw new Error(
+      `GitNexus internal: unable to assign a unique repo id for "${name}" at ${repoPath}`,
+    );
   }
 
   // ─── Repo Resolution ─────────────────────────────────────────────
@@ -357,8 +716,20 @@ export class LocalBackend {
    * On a miss, re-reads the registry once in case a new repo was indexed
    * while the MCP server was running.
    */
-  async resolveRepo(repoParam?: string): Promise<RepoHandle> {
-    const result = this.resolveRepoFromCache(repoParam);
+  async resolveRepo(repoParam?: string, branch?: string): Promise<RepoHandle> {
+    let refreshedAfterAmbiguity = false;
+    let result: RepoHandle | null;
+    try {
+      result = this.resolveRepoFromCache(repoParam);
+    } catch (err) {
+      if (!(err instanceof RegistryAmbiguousTargetError)) throw err;
+      // Stale in-memory duplicate siblings can linger after unregister; refresh
+      // once before re-throwing so a resolved registry can disambiguate (#1658).
+      await this.refreshRepos();
+      refreshedAfterAmbiguity = true;
+      result = this.resolveRepoFromCache(repoParam);
+    }
+
     if (result) {
       // Issue: silent graph drift across sibling clones.
       // If the caller's cwd lives in a *different* on-disk clone of
@@ -369,15 +740,17 @@ export class LocalBackend {
       this.maybeWarnSiblingDrift(result).catch(() => {
         /* best-effort; never throw from resolveRepo */
       });
-      return result;
+      return this.applyBranchScope(result, branch);
     }
 
-    // Miss — refresh registry and try once more
-    await this.refreshRepos();
+    // Miss — refresh registry and try once more (skip if already refreshed above)
+    if (!refreshedAfterAmbiguity) {
+      await this.refreshRepos();
+    }
     const retried = this.resolveRepoFromCache(repoParam);
     if (retried) {
       this.maybeWarnSiblingDrift(retried).catch(() => {});
-      return retried;
+      return this.applyBranchScope(retried, branch);
     }
 
     // Still no match — throw with helpful message
@@ -407,28 +780,112 @@ export class LocalBackend {
   }
 
   /**
+   * Re-point a resolved repo handle at a specific branch index (#2106).
+   *
+   * - No `branch` (default) → the primary/flat handle, unchanged (backward
+   *   compatible: every existing caller passes no branch).
+   * - `branch` equal to the known primary → the flat handle.
+   * - `branch` matching an indexed non-primary branch → a handle whose
+   *   `lbugPath` points at `branches/<slug>/lbug`; the connection pool keys by
+   *   `lbugPath`, so this is the only change needed to scope every tool.
+   * - `branch` that was never indexed → a clear error (never a silently-empty
+   *   result against the wrong DB).
+   */
+  private async applyBranchScope(handle: RepoHandle, branch?: string): Promise<RepoHandle> {
+    if (!branch) return handle;
+    if (handle.branch && handle.branch === branch) return handle;
+    const summary = handle.branches?.find((b) => b.branch === branch);
+    if (summary) {
+      const { lbugPath } = getStoragePaths(handle.repoPath, branch);
+      return {
+        ...handle,
+        lbugPath,
+        indexedAt: summary.indexedAt,
+        lastCommit: summary.lastCommit,
+        stats: summary.stats,
+      };
+    }
+    // Legacy entry (pre-#2106): the registry has no recorded primary `branch`,
+    // so a `--branch <primary>` request misses the checks above. Read the flat
+    // meta.json (next to the flat handle's lbug) to learn the primary and serve
+    // the flat handle only when it actually matches — never serve flat for an
+    // arbitrary unindexed branch (#2106 R4).
+    if (!handle.branch) {
+      const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
+      if (flatMeta?.branch && flatMeta.branch === branch) return handle;
+    }
+    const indexed = [handle.branch, ...(handle.branches?.map((b) => b.branch) ?? [])].filter(
+      Boolean,
+    );
+    const available = indexed.length > 0 ? indexed.join(', ') : '(primary only)';
+    throw new Error(
+      `Branch "${branch}" is not indexed for "${handle.name}". ` +
+        `Indexed branches: ${available}. Run: gitnexus analyze --branch ${branch}`,
+    );
+  }
+
+  /**
    * Try to resolve a repo from the in-memory cache. Returns null on miss.
+   * Throws {@link RegistryAmbiguousTargetError} when `repoParam` matches
+   * multiple handles by name and cwd cannot disambiguate (#1658).
    */
   private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
     if (this.repos.size === 0) return null;
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
-      // Match by id
+      const looksLikePath =
+        path.isAbsolute(repoParam) || repoParam.includes(path.sep) || repoParam.includes('/');
+
+      const resolvePathMatch = (): RepoHandle | undefined => {
+        const canonicalTarget = canonicalizePath(repoParam);
+        return [...this.repos.values()].find((handle) => {
+          const stored = canonicalizePath(handle.repoPath);
+          return process.platform === 'win32'
+            ? stored.toLowerCase() === canonicalTarget.toLowerCase()
+            : stored === canonicalTarget;
+        });
+      };
+
+      // Path-like params first (absolute or contains separators) — aligns with
+      // resolveRegistryEntry (#829). Bare aliases such as ".tmp-repro-mini" must
+      // not be resolved via path.resolve(cwd) before duplicate-name handling.
+      if (looksLikePath) {
+        const pathMatch = resolvePathMatch();
+        if (pathMatch) return pathMatch;
+      }
+
+      // Exact name before id — the first duplicate sibling keeps id === name
+      // (e.g. id "shared"), so a name lookup must not be captured by the id tier.
+      const nameMatches = [...this.repos.values()].filter(
+        (handle) => handle.name.toLowerCase() === paramLower,
+      );
+      if (nameMatches.length === 1) return nameMatches[0];
+      if (nameMatches.length > 1) {
+        const cwdPick = this.pickRepoHandleForCwd(nameMatches);
+        if (cwdPick) return cwdPick;
+        throw new RegistryAmbiguousTargetError(
+          repoParam,
+          nameMatches.map((h) => this.handleToRegistryEntry(h)),
+        );
+      }
+
+      // Stable hashed id (e.g. "shared-abc123") from repoId() collision suffix
       if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
-      // Match by name (case-insensitive)
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase() === paramLower) return handle;
+
+      // Bare name resolved as a cwd-relative path (e.g. "myrepo" against process.cwd()),
+      // after name/id tiers. Path-like strings with separators were handled at the top.
+      if (!looksLikePath) {
+        const pathMatch = resolvePathMatch();
+        if (pathMatch) return pathMatch;
       }
-      // Match by path (substring)
-      const resolved = path.resolve(repoParam);
-      for (const handle of this.repos.values()) {
-        if (handle.repoPath === resolved) return handle;
-      }
-      // Match by partial name
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase().includes(paramLower)) return handle;
-      }
+
+      // Partial name — only when unambiguous
+      const partialMatches = [...this.repos.values()].filter((handle) =>
+        handle.name.toLowerCase().includes(paramLower),
+      );
+      if (partialMatches.length === 1) return partialMatches[0];
+
       return null;
     }
 
@@ -439,45 +896,95 @@ export class LocalBackend {
     return null; // Multiple repos, no param — ambiguous
   }
 
+  /**
+   * Prefer the indexed repo whose path matches the git root of process.cwd().
+   *
+   * In MCP stdio server mode, `process.cwd()` is the server's launch directory,
+   * not the agent client's cwd. If the server was started from an unrelated
+   * directory, `getGitRoot` returns null and duplicate-name resolution throws
+   * {@link RegistryAmbiguousTargetError} — callers should pass an absolute path.
+   */
+  private pickRepoHandleForCwd(candidates: RepoHandle[]): RepoHandle | null {
+    const cwdRoot = getGitRoot(process.cwd());
+    if (!cwdRoot) return null;
+    const canonicalCwd = canonicalizePath(cwdRoot);
+    const cwdMatches = candidates.filter((handle) => {
+      const stored = canonicalizePath(handle.repoPath);
+      return process.platform === 'win32'
+        ? stored.toLowerCase() === canonicalCwd.toLowerCase()
+        : stored === canonicalCwd;
+    });
+    return cwdMatches.length === 1 ? cwdMatches[0] : null;
+  }
+
+  private handleToRegistryEntry(handle: RepoHandle): RegistryEntry {
+    return {
+      name: handle.name,
+      path: handle.repoPath,
+      storagePath: handle.storagePath,
+      indexedAt: handle.indexedAt,
+      lastCommit: handle.lastCommit,
+      stats: handle.stats,
+      remoteUrl: handle.remoteUrl,
+    };
+  }
+
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
-  private async ensureInitialized(repoId: string): Promise<void> {
+  /**
+   * Ensure the LadybugDB pool is open for the *resolved* repo.
+   *
+   * Takes the `RepoHandle` the caller resolved — NOT a bare id — and keys the
+   * pool (and the init/staleness/reinit maps) by the immutable `lbugPath`. Two
+   * things matter for multi-clone correctness: (1) the handle is the one the
+   * caller resolved, so a concurrent `refreshRepos` can't substitute a different
+   * clone; (2) the pool key is the database path, so distinct clones never share
+   * a pool entry even when their name-derived id transiently collides (#2067).
+   */
+  private async ensureInitialized(repo: RepoHandle): Promise<void> {
+    const poolKey = repo.lbugPath;
     // If a reinit is already in progress for this repo, wait for it
-    const pending = this.reinitPromises.get(repoId);
+    const pending = this.reinitPromises.get(poolKey);
     if (pending) return pending;
-
-    const handle = this.repos.get(repoId);
-    if (!handle) throw new Error(`Unknown repo: ${repoId}`);
 
     // Check if the index was rebuilt since we opened the connection (#297).
     // Throttle staleness checks to at most once per 5 seconds per repo to
     // avoid an fs.readFile round-trip on every tool invocation.
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+    if (this.initializedRepos.has(poolKey) && isLbugReady(poolKey)) {
       const now = Date.now();
-      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
+      const lastCheck = this.lastStalenessCheck.get(poolKey) ?? 0;
       if (now - lastCheck < 5000) return; // Checked recently — skip
 
-      this.lastStalenessCheck.set(repoId, now);
+      this.lastStalenessCheck.set(poolKey, now);
       try {
-        const metaPath = path.join(handle.storagePath, 'meta.json');
+        // Read the meta.json that sits next to THIS handle's lbug. For the
+        // flat/primary handle this is `<storagePath>/meta.json` (unchanged);
+        // for a branch handle it is `<storagePath>/branches/<slug>/meta.json`.
+        // Reading the flat meta for a branch handle would compare the branch
+        // index's indexedAt against the primary's and thrash the pool (#2106).
+        const metaPath = path.join(path.dirname(repo.lbugPath), 'meta.json');
         const metaRaw = await fs.readFile(metaPath, 'utf-8');
         const meta = JSON.parse(metaRaw);
-        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
+        // Compare against the last indexedAt OBSERVED for this pool (keyed by
+        // lbugPath), not the handle's — branch handles are fresh spreads so a
+        // handle mutation would not persist and would reinit on every check.
+        const observed = this.lastObservedIndexedAt.get(poolKey) ?? repo.indexedAt;
+        if (meta.indexedAt && meta.indexedAt !== observed) {
           // Index was rebuilt — close stale connection and re-init.
           // Wrap in reinitPromises to prevent TOCTOU race where concurrent
           // callers both detect staleness and double-close the pool.
           const reinit = (async () => {
             try {
-              await closeLbug(repoId);
-              this.initializedRepos.delete(repoId);
-              handle.indexedAt = meta.indexedAt;
-              await initLbug(repoId, handle.lbugPath);
-              this.initializedRepos.add(repoId);
+              await closeLbug(poolKey);
+              this.initializedRepos.delete(poolKey);
+              this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
+              await initLbug(poolKey, repo.lbugPath);
+              this.initializedRepos.add(poolKey);
             } finally {
-              this.reinitPromises.delete(repoId);
+              this.reinitPromises.delete(poolKey);
             }
           })();
-          this.reinitPromises.set(repoId, reinit);
+          this.reinitPromises.set(poolKey, reinit);
           return reinit;
         } else {
           return; // Pool is current
@@ -488,11 +995,12 @@ export class LocalBackend {
     }
 
     try {
-      await initLbug(repoId, handle.lbugPath);
-      this.initializedRepos.add(repoId);
+      await initLbug(poolKey, repo.lbugPath);
+      this.initializedRepos.add(poolKey);
+      this.lastObservedIndexedAt.set(poolKey, repo.indexedAt);
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
-      this.initializedRepos.delete(repoId);
+      this.initializedRepos.delete(poolKey);
       throw err;
     }
   }
@@ -525,18 +1033,7 @@ export class LocalBackend {
    *     that another clone of the same logical repo is registered).
    *   - `remoteUrl`: the canonical origin URL recorded at index time.
    */
-  async listRepos(): Promise<
-    Array<{
-      name: string;
-      path: string;
-      indexedAt: string;
-      lastCommit: string;
-      remoteUrl?: string;
-      stats?: any;
-      staleness?: { commitsBehind: number; hint?: string };
-      siblings?: Array<{ name: string; path: string; lastCommit: string }>;
-    }>
-  > {
+  async listRepos(): Promise<RepoListing[]> {
     await this.refreshRepos();
     const handles = [...this.repos.values()];
 
@@ -586,8 +1083,69 @@ export class LocalBackend {
                 lastCommit: s.lastCommit,
               }))
             : undefined,
+        branch: h.branch,
+        branches:
+          h.branches && h.branches.length > 0
+            ? h.branches.map((b) => ({
+                branch: b.branch,
+                indexedAt: b.indexedAt,
+                lastCommit: b.lastCommit,
+              }))
+            : undefined,
       };
     });
+  }
+
+  /**
+   * Paginated view over {@link listRepos} for the `list_repos` MCP tool (#2119).
+   *
+   * `listRepos()` itself still returns the FULL array — its resource and CLI
+   * consumers (`gitnexus://repos`, `gitnexus://setup`, startup logs) need every
+   * entry, so pagination lives ONLY here, on the tool surface, to keep the
+   * response under MCP/LLM token-truncation limits.
+   *
+   * Determinism: a single registry snapshot is taken per call, then sorted by
+   * lower-cased name with the repository path as a tie-breaker. Sibling clones
+   * share a name but never a path (#2054), so `(name, path)` is a total order —
+   * paging never skips or duplicates an entry while the registry is unchanged.
+   * Codepoint comparison (not `localeCompare`) keeps page boundaries stable
+   * across machines/locales, matching the existing `refreshRepos` ordering.
+   */
+  async listReposPage(params?: { limit?: unknown; offset?: unknown } | null): Promise<{
+    repositories: RepoListing[];
+    pagination: ListReposPagination;
+  }> {
+    const { limit, offset } = parseListReposPagination(params, {
+      defaultLimit: LIST_REPOS_DEFAULT_LIMIT,
+      maxLimit: LIST_REPOS_MAX_LIMIT,
+    });
+
+    // One consistent snapshot per call (listRepos refreshes the registry once),
+    // sorted into a stable total order before slicing.
+    const all = await this.listRepos();
+    all.sort((a, b) => {
+      const an = a.name.toLowerCase();
+      const bn = b.name.toLowerCase();
+      if (an !== bn) return an < bn ? -1 : 1;
+      return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+    });
+
+    const total = all.length;
+    const repositories = all.slice(offset, offset + limit);
+    const returned = repositories.length;
+    const hasMore = offset + returned < total;
+
+    return {
+      repositories,
+      pagination: {
+        total,
+        limit,
+        offset,
+        returned,
+        hasMore,
+        ...(hasMore && { nextOffset: offset + returned }),
+      },
+    };
   }
 
   /**
@@ -651,7 +1209,10 @@ export class LocalBackend {
 
   async callTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
-      return this.listRepos();
+      // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
+      // callers; the tool wraps it in { repositories, pagination } and forwards
+      // the limit/offset args that this dispatch previously discarded.
+      return this.listReposPage(params);
     }
 
     if (method.startsWith('group_')) {
@@ -667,8 +1228,10 @@ export class LocalBackend {
       return this.callToolAtGroupRepo(method, p);
     }
 
-    // Resolve repo from optional param (re-reads registry on miss)
-    const repo = await this.resolveRepo((params as { repo?: string } | undefined)?.repo);
+    // Resolve repo from optional param (re-reads registry on miss). An optional
+    // `branch` param scopes the resolved handle to that branch's index (#2106).
+    const repoParams = params as { repo?: string; branch?: string } | undefined;
+    const repo = await this.resolveRepo(repoParams?.repo, repoParams?.branch);
 
     switch (method) {
       case 'query':
@@ -730,7 +1293,7 @@ export class LocalBackend {
       return { error: 'query parameter is required and cannot be empty.' };
     }
 
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
@@ -755,8 +1318,10 @@ export class LocalBackend {
       timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
     ]);
 
-    const bm25Results = bm25SearchResult.results;
-    const ftsUsed = bm25SearchResult.ftsUsed;
+    // Guard against undefined results (#1489) — when FTS is entirely
+    // unavailable the search helper may return an unexpected shape.
+    const bm25Results = bm25SearchResult?.results ?? [];
+    const ftsUsed = bm25SearchResult?.ftsUsed ?? false;
 
     // Merge via reciprocal rank fusion
     timer.start('merge');
@@ -774,8 +1339,9 @@ export class LocalBackend {
       }
     }
 
-    for (let i = 0; i < semanticResults.length; i++) {
-      const result = semanticResults[i];
+    const safeSemanticResults = semanticResults ?? [];
+    for (let i = 0; i < safeSemanticResults.length; i++) {
+      const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
       const rrfScore = 1 / (60 + i);
       const existing = scoreMap.get(key);
@@ -808,6 +1374,112 @@ export class LocalBackend {
     >();
     const definitions: any[] = []; // standalone symbols not in any process
 
+    // Batch-fetch process participation, cohesion, and (optionally) content for
+    // ALL matched symbols in 2-3 graph queries instead of 2-3 *per symbol*. The
+    // previous per-symbol loop issued up to 3N sequential pool round-trips
+    // (searchLimit symbols × {STEP_IN_PROCESS, MEMBER_OF, content}); on a warm
+    // repo the IPC + query-setup overhead of those round-trips dominated query
+    // latency. Collapsing to `WHERE n.id IN $nodeIds` preserves identical output
+    // (the aggregation loop below is unchanged) while cutting the round-trips.
+    // Array params bind through the pool exactly as bm25Search's
+    // `WHERE n.id IN $nodeIds` already does. (Ported from gitnexus-enterprise
+    // PR #222 — N+1 → 2-3 batched queries.)
+    const nodeIds = merged.map(([, m]) => m.data?.nodeId).filter((id): id is string => !!id);
+
+    const processRowsByNode = new Map<string, any[]>();
+    const cohesionByNode = new Map<string, { cohesion: number; module?: string }>();
+    const contentByNode = new Map<string, string>();
+    // Set when a batched enrichment query throws a REAL failure (timeout, lock,
+    // native fault) — NOT the benign "no Process/Community table" case, which is
+    // a normal config (a repo analyzed without processes/communities) and must
+    // not raise a `partial` flag callers would learn to ignore. See
+    // isBenignMissingTableError + the response build below.
+    let enrichmentDegraded = false;
+
+    // Chunk the IN-list like the impact path (CHUNK_SIZE=100) so a large result
+    // set never builds an unbounded `IN` parameter. Default batch is
+    // processLimit*maxSymbolsPerProcess (≤ one chunk), but chunk for robustness.
+    const QUERY_CHUNK_SIZE = 100;
+    for (let i = 0; i < nodeIds.length; i += QUERY_CHUNK_SIZE) {
+      const ids = nodeIds.slice(i, i + QUERY_CHUNK_SIZE);
+
+      // Processes each symbol participates in. `n.id AS nodeId` is prepended as
+      // column 0 so rows from many symbols can be re-associated to their symbol.
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `,
+          { nodeIds: ids },
+        );
+        for (const row of rows) {
+          const nid = row.nodeId ?? row[0];
+          let list = processRowsByNode.get(nid);
+          if (!list) processRowsByNode.set(nid, (list = []));
+          list.push(row);
+        }
+      } catch (e) {
+        logQueryError('query:process-lookup', e);
+        if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+      }
+
+      // Cluster membership + cohesion. Keep the FIRST community row per node to
+      // mirror the prior per-symbol `LIMIT 1` (each symbol keeps ITS community,
+      // not one community for the whole batch).
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+        `,
+          { nodeIds: ids },
+        );
+        for (const row of rows) {
+          const nid = row.nodeId ?? row[0];
+          if (!cohesionByNode.has(nid)) {
+            cohesionByNode.set(nid, {
+              cohesion: (row.cohesion ?? row[1]) || 0,
+              module: row.module ?? row[2],
+            });
+          }
+        }
+      } catch (e) {
+        logQueryError('query:cluster-info', e);
+        if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+      }
+
+      // Optionally fetch content for every matched symbol.
+      if (includeContent) {
+        try {
+          const rows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (n)
+            WHERE n.id IN $nodeIds
+            RETURN n.id AS nodeId, n.content AS content
+          `,
+            { nodeIds: ids },
+          );
+          for (const row of rows) {
+            const nid = row.nodeId ?? row[0];
+            contentByNode.set(nid, row.content ?? row[1]);
+          }
+        } catch (e) {
+          logQueryError('query:content-fetch', e);
+          if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+        }
+      }
+    }
+
+    // Aggregation is unchanged from the per-symbol version — it now reads the
+    // pre-fetched maps instead of issuing a query per symbol. Iterating `merged`
+    // in the same (sorted) order preserves processMap insertion order, the
+    // definitions order, and the item.score association exactly.
     for (const [_, item] of merged) {
       const sym = item.data;
       if (!sym.nodeId) {
@@ -820,61 +1492,11 @@ export class LocalBackend {
         continue;
       }
 
-      // Find processes this symbol participates in
-      let processRows: any[] = [];
-      try {
-        processRows = await executeParameterized(
-          repo.id,
-          `
-          MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `,
-          { nodeId: sym.nodeId },
-        );
-      } catch (e) {
-        logQueryError('query:process-lookup', e);
-      }
-
-      // Get cluster membership + cohesion (cohesion used as internal ranking signal)
-      let cohesion = 0;
-      let module: string | undefined;
-      try {
-        const cohesionRows = await executeParameterized(
-          repo.id,
-          `
-          MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
-          LIMIT 1
-        `,
-          { nodeId: sym.nodeId },
-        );
-        if (cohesionRows.length > 0) {
-          cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
-          module = cohesionRows[0].module ?? cohesionRows[0][1];
-        }
-      } catch (e) {
-        logQueryError('query:cluster-info', e);
-      }
-
-      // Optionally fetch content
-      let content: string | undefined;
-      if (includeContent) {
-        try {
-          const contentRows = await executeParameterized(
-            repo.id,
-            `
-            MATCH (n {id: $nodeId})
-            RETURN n.content AS content
-          `,
-            { nodeId: sym.nodeId },
-          );
-          if (contentRows.length > 0) {
-            content = contentRows[0].content ?? contentRows[0][0];
-          }
-        } catch (e) {
-          logQueryError('query:content-fetch', e);
-        }
-      }
+      const processRows = processRowsByNode.get(sym.nodeId) ?? [];
+      const coh = cohesionByNode.get(sym.nodeId);
+      const cohesion = coh?.cohesion ?? 0;
+      const module = coh?.module;
+      const content = includeContent ? contentByNode.get(sym.nodeId) : undefined;
 
       const symbolEntry = {
         id: sym.nodeId,
@@ -893,12 +1515,13 @@ export class LocalBackend {
       } else {
         // Add to each process it belongs to
         for (const row of processRows) {
-          const pid = row.pid ?? row[0];
-          const label = row.label ?? row[1];
-          const hLabel = row.heuristicLabel ?? row[2];
-          const pType = row.processType ?? row[3];
-          const stepCount = row.stepCount ?? row[4];
-          const step = row.step ?? row[5];
+          // Positional fallbacks shift +1 because `n.id AS nodeId` is column 0.
+          const pid = row.pid ?? row[1];
+          const label = row.label ?? row[2];
+          const hLabel = row.heuristicLabel ?? row[3];
+          const pType = row.processType ?? row[4];
+          const stepCount = row.stepCount ?? row[5];
+          const step = row.step ?? row[6];
 
           if (!processMap.has(pid)) {
             processMap.set(pid, {
@@ -972,15 +1595,29 @@ export class LocalBackend {
     const timing = timer.summary();
     logQueryTiming(searchQuery, timing);
 
+    // Compose a single `warning` from all degraded conditions (FTS-missing
+    // and/or a real enrichment failure) so neither overwrites the other, and
+    // flag `partial` when enrichment was lost. Both are omitted on the clean
+    // path, leaving the success-path response shape byte-identical.
+    const warnings: string[] = [];
+    if (!ftsUsed) {
+      warnings.push(
+        'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.',
+      );
+    }
+    if (enrichmentDegraded) {
+      warnings.push(
+        'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
+      );
+    }
+
     return {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
-      ...(!ftsUsed && {
-        warning:
-          'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.',
-      }),
+      ...(warnings.length > 0 && { warning: warnings.join(' ') }),
+      ...(enrichmentDegraded && { partial: true }),
     };
   }
 
@@ -992,10 +1629,20 @@ export class LocalBackend {
     query: string,
     limit: number,
   ): Promise<{ results: any[]; ftsUsed: boolean }> {
-    const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
+    let searchFTSFromLbug;
+    try {
+      ({ searchFTSFromLbug } = await import('../../core/search/bm25-index.js'));
+    } catch (err: any) {
+      // Module import can fail in sandboxed MCP contexts (#1489)
+      logger.warn(
+        { err: err?.message },
+        'GitNexus: bm25-index.js import failed — falling back to semantic-only',
+      );
+      return { results: [], ftsUsed: false };
+    }
     let ftsResponse;
     try {
-      ftsResponse = await searchFTSFromLbug(query, limit, repo.id);
+      ftsResponse = await searchFTSFromLbug(query, limit, repo.lbugPath);
     } catch (err: any) {
       logger.error(
         { err: err.message },
@@ -1004,8 +1651,10 @@ export class LocalBackend {
       return { results: [], ftsUsed: false };
     }
 
-    const bm25Results = ftsResponse.results;
-    const ftsUsed = ftsResponse.ftsAvailable;
+    // Guard against unexpected response shape (#1489) — ftsResponse.results
+    // could be undefined when the FTS extension is unavailable in the MCP process.
+    const bm25Results = ftsResponse?.results ?? [];
+    const ftsUsed = ftsResponse?.ftsAvailable ?? false;
 
     const results: any[] = [];
 
@@ -1018,7 +1667,7 @@ export class LocalBackend {
         const nodeIds = bm25Result.nodeIds?.length ? bm25Result.nodeIds : null;
         const symbols = nodeIds
           ? await executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
               MATCH (n)
               WHERE n.id IN $nodeIds
@@ -1027,10 +1676,15 @@ export class LocalBackend {
               { nodeIds },
             )
           : await executeParameterized(
-              repo.id,
+              repo.lbugPath,
+              // Same BasicBlock exclusion as detect_changes (#2082 U7): on a
+              // --pdg index a function-heavy file has far more BasicBlock rows
+              // than symbols, so an unfiltered LIMIT 3 would surface nameless
+              // substrate rows and displace the real symbols.
               `
               MATCH (n)
               WHERE n.filePath = $filePath
+                AND NOT n.id STARTS WITH 'BasicBlock:'
               RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
               LIMIT 3
             `,
@@ -1079,7 +1733,7 @@ export class LocalBackend {
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN COUNT(*) AS cnt LIMIT 1`,
       );
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
@@ -1107,7 +1761,7 @@ export class LocalBackend {
             ORDER BY distance
           `;
 
-            const embResults = await executeQuery(repo.id, vectorQuery);
+            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
             return embResults.map((row) => ({
               nodeId: row.nodeId ?? row[0],
               chunkIndex: row.chunkIndex ?? row[1] ?? 0,
@@ -1136,7 +1790,7 @@ export class LocalBackend {
         if (embeddingCount > exactLimit) return [];
 
         const rows = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (e:${EMBEDDING_TABLE_NAME})
           RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex,
@@ -1180,7 +1834,7 @@ export class LocalBackend {
               ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
               : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`;
 
-          const nodeRows = await executeParameterized(repo.id, nodeQuery, { nodeId });
+          const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
             const nodeRow = nodeRows[0];
             results.push({
@@ -1203,31 +1857,41 @@ export class LocalBackend {
     }
   }
 
-  async executeCypher(repoName: string, query: string): Promise<any> {
+  async executeCypher(
+    repoName: string,
+    query: string,
+    params: Record<string, unknown> = {},
+  ): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    return this.cypher(repo, { query });
+    return this.cypher(repo, { query, params });
   }
 
-  private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+  private async cypher(
+    repo: RepoHandle,
+    request: { query: string; params?: Record<string, unknown> },
+  ): Promise<any> {
+    await this.ensureInitialized(repo);
 
-    if (!isLbugReady(repo.id)) {
+    if (!isLbugReady(repo.lbugPath)) {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
-
-    // Block write operations (defense-in-depth — DB is already read-only)
-    if (isWriteQuery(params.query)) {
+    if (request.params !== undefined && !isValidQueryParams(request.params)) {
       return {
-        error:
-          'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.',
+        error: '"params" must be a plain object with scalar values (string/number/boolean/null).',
       };
     }
 
     try {
-      const result = await executeQuery(repo.id, params.query);
+      const result = await executeParameterized(repo.lbugPath, request.query, request.params ?? {});
       return result;
     } catch (err: any) {
       const msg = err.message || 'Query failed';
+      if (isReadOnlyDbError(err)) {
+        return {
+          error:
+            'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.',
+        };
+      }
       if (isWalCorruptionError(err)) {
         return {
           error: msg,
@@ -1324,7 +1988,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { showClusters?: boolean; showProcesses?: boolean; limit?: number },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const limit = params.limit || 20;
     const result: any = {
@@ -1340,7 +2004,7 @@ export class LocalBackend {
         // Fetch more raw communities than the display limit so aggregation has enough data
         const rawLimit = Math.max(limit * 5, 200);
         const clusters = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (c:Community)
           RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -1364,7 +2028,7 @@ export class LocalBackend {
     if (params.showProcesses !== false) {
       try {
         const processes = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (p:Process)
           RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -1408,7 +2072,7 @@ export class LocalBackend {
     if (ids.length === 0) return;
     try {
       const rows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n:\`Class\`) WHERE n.id IN $ids RETURN n.id AS id, 'Class' AS label
         UNION ALL
@@ -1531,7 +2195,7 @@ export class LocalBackend {
     // Direct UID — zero-ambiguity path.
     if (uid) {
       const rows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `MATCH (n {id: $uid}) RETURN ${selectClause} LIMIT 1`,
         { uid },
       );
@@ -1570,7 +2234,7 @@ export class LocalBackend {
     // LIMIT 20 (was 10) — scoring is the point now, so give the ranker
     // headroom instead of arbitrary truncation.
     const rows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `MATCH (n) ${whereClause} RETURN ${selectClause} LIMIT 20`,
       queryParams,
     );
@@ -1610,7 +2274,7 @@ export class LocalBackend {
         const candidateIds = normalized.map((s) => s.id).filter(Boolean);
         for (const label of ['Class', 'Interface']) {
           const labelRows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1`,
             { candidateIds },
           ).catch(() => []);
@@ -1713,7 +2377,7 @@ export class LocalBackend {
       include_content?: boolean;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const { name, uid, file_path, kind, include_content } = params;
 
@@ -1753,7 +2417,7 @@ export class LocalBackend {
 
     // Categorized incoming refs
     const incomingRows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
@@ -1778,7 +2442,7 @@ export class LocalBackend {
       try {
         // Single UNION query instead of two serial round-trips.
         const typeCheck = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n:Class) WHERE n.id = $symId RETURN 'Class' AS label LIMIT 1
           UNION ALL
@@ -1800,7 +2464,7 @@ export class LocalBackend {
         const [ctorIncoming, fileIncoming, typedPropertyIncoming, typedProperties] =
           await Promise.all([
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
@@ -1812,7 +2476,7 @@ export class LocalBackend {
               { symId },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
@@ -1824,7 +2488,7 @@ export class LocalBackend {
               { symId },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (p:\`Property\`)
             WHERE p.declaredType = $name
@@ -1842,7 +2506,7 @@ export class LocalBackend {
               },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (p:\`Property\`)
             WHERE p.declaredType = $name
@@ -1881,7 +2545,7 @@ export class LocalBackend {
 
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
@@ -1895,7 +2559,7 @@ export class LocalBackend {
     let processRows: any[] = [];
     try {
       processRows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n {id: $symId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
         RETURN p.id AS pid, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
@@ -1927,11 +2591,35 @@ export class LocalBackend {
     const symKind = isClassLike ? resolvedLabel || 'Class' : sym.type || sym[2];
     const isMethodLike =
       symKind === 'Method' || symKind === 'Function' || symKind === 'Constructor';
+
+    // #1858 review F2 — start the epistemic boundary probe here (right after
+    // `symKind` is known) so it runs CONCURRENTLY with the methodMetadata fetch
+    // below, mirroring how _runImpactBFS overlaps it with the BFS. It is awaited
+    // at result assembly. (It cannot start earlier — `symKind` is only computed
+    // on this line, after the incoming/outgoing round-trips.)
+    //
+    // #1858 review F3 — pass an interface-preserving type, NOT `symKind`.
+    // `symKind` collapses a single-resolved Interface to 'Class' (resolvedLabel
+    // is '' on the single-candidate path), which would skip computeEpistemicBoundary's
+    // `symType === 'Interface'` self-boundary branch and under-report a leaf
+    // interface as 'exact'. `enrichCandidateLabels` runs BEFORE the single-candidate
+    // early return and patches `sym.type` from '' to 'Interface' (LadybugDB returns
+    // '' for labels()[0] on Interface/Class), so `sym.type` is the reliable signal
+    // here — mirroring impact()'s `resolvedLabel || symbol.type` derivation. Do not
+    // "fix" enrichment ordering; F3 depends on enrichment-before-early-return.
+    const epistemicSymType = (resolvedLabel || sym.type || symKind || '') as string;
+    const epistemicPromise = this.computeEpistemicBoundary(
+      repo,
+      symId,
+      epistemicSymType,
+      (sym.name || sym[1]) as string,
+    );
+
     let methodMetadata: Record<string, unknown> | undefined;
     if (isMethodLike) {
       try {
         const metaRows = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n {id: $symId})
           RETURN n.visibility AS visibility, n.isStatic AS isStatic, n.isAbstract AS isAbstract,
@@ -1959,6 +2647,13 @@ export class LocalBackend {
       }
     }
 
+    // #1858 — same epistemic boundary signal as impact(): when this symbol sits
+    // behind an interface / indirection boundary, callers binding via DI or
+    // dynamic dispatch are not reflected in `incoming`, so the view is a lower
+    // bound. Additive; never suppresses a field. Resolved from the probe started
+    // above (concurrent with methodMetadata).
+    const epistemic = await epistemicPromise;
+
     return {
       status: 'found',
       symbol: {
@@ -1971,6 +2666,7 @@ export class LocalBackend {
         ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
         ...(methodMetadata ? { methodMetadata } : {}),
       },
+      ...epistemic,
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
       ...(typedPropertyRows.length > 0
@@ -2001,7 +2697,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { name: string; type: 'symbol' | 'cluster' | 'process' },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
     const { name, type } = params;
 
     if (type === 'symbol') {
@@ -2010,7 +2706,7 @@ export class LocalBackend {
 
     if (type === 'cluster') {
       const clusters = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -2037,7 +2733,7 @@ export class LocalBackend {
       }
 
       const members = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -2066,7 +2762,7 @@ export class LocalBackend {
 
     if (type === 'process') {
       const processes = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (p:Process)
         WHERE p.label = $processName OR p.heuristicLabel = $processName
@@ -2080,7 +2776,7 @@ export class LocalBackend {
       const proc = processes[0];
       const procId = proc.id || proc[0];
       const steps = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
         RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
@@ -2118,9 +2814,10 @@ export class LocalBackend {
     params: {
       scope?: string;
       base_ref?: string;
+      worktree?: string;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const scope = params.scope || 'unstaged';
     const { execFileSync } = await import('child_process');
@@ -2146,13 +2843,54 @@ export class LocalBackend {
 
     let diffOutput: string;
     try {
+      // Resolve the cwd for git diff.
+      //
+      // In a linked worktree (e.g. /repo/wt-feature/), the user's staged and
+      // unstaged changes live in that worktree's separate working directory and
+      // index. Running `git diff` from the canonical repo root sees a different
+      // working tree and returns empty output.
+      //
+      // Resolution order (see resolveWorktreeCwd for details):
+      //   1. params.worktree — explicit override, validated against the
+      //      registered repo's canonical root.
+      //   2. Auto-detect — if the server's launch cwd (process.cwd()) is a
+      //      linked worktree of the same canonical repo, use its git root.
+      //   3. repo.repoPath — fallback (original behaviour, handled inside
+      //      resolveWorktreeCwd when no worktree is detected).
+      //
+      // Start with the auto-detected value; override with the validated
+      // explicit param when provided. This avoids a dead initial assignment.
+      let diffCwd = resolveWorktreeCwd(repo.repoPath, process.cwd());
+      if (params.worktree) {
+        if (!path.isAbsolute(params.worktree)) {
+          return {
+            error: `worktree must be an absolute path, got: "${params.worktree}"`,
+          };
+        }
+        const providedResolved = path.resolve(params.worktree);
+        const repoCanonical = getCanonicalRepoRoot(repo.repoPath);
+        if (!repoCanonical) {
+          return {
+            error: `Could not determine canonical root for repo "${repo.repoPath}". Is git available?`,
+          };
+        }
+        const worktreeCanonical = getCanonicalRepoRoot(providedResolved);
+        if (!worktreeCanonical || tryRealpath(worktreeCanonical) !== tryRealpath(repoCanonical)) {
+          return {
+            error: `worktree "${params.worktree}" is not a worktree of repo "${repo.repoPath}". Ensure the path is inside the same git repository.`,
+          };
+        }
+        diffCwd = providedResolved;
+      }
+
       // maxBuffer raised from Node's 1MB default to 256MB to avoid ENOBUFS on
       // repos with large unstaged/untracked diffs (e.g. unignored build folders).
       // See issue: spawnSync git ENOBUFS in detect_changes(scope="unstaged").
       diffOutput = execFileSync('git', diffArgs, {
-        cwd: repo.repoPath,
+        cwd: diffCwd,
         encoding: 'utf-8',
         maxBuffer: 256 * 1024 * 1024,
+        windowsHide: true,
       });
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
@@ -2189,8 +2927,20 @@ export class LocalBackend {
         queryParams[`hunkEnd${i}`] = hunk.endLine;
       });
 
+      // Exclude BasicBlock rows by id prefix: on a --pdg index every edited
+      // function otherwise contributes N nameless BasicBlock pseudo-"symbols"
+      // (they carry filePath/start/end but no name), inflating changed_count
+      // and risk level with rows no consumer can act on (#2082 U7). Blocks
+      // are implementation substrate, not symbols — the owning Function row
+      // already represents the change. The id prefix (`BasicBlock:<file>:…`,
+      // cfg/emit.ts basicBlockId) beats a label predicate (`labels(n)[0]` is
+      // known to come back empty for several node types — see
+      // enrichCandidateLabels) AND beats `n.name IS NOT NULL` (which would
+      // also drop legitimate symbols whose name loaded as NULL, e.g.
+      // quoted-empty CSV fields for anonymous constructs).
       const symbolQuery = `
         MATCH (n) WHERE n.filePath ENDS WITH $filePath
+          AND NOT n.id STARTS WITH 'BasicBlock:'
           AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
           AND (${overlapConditions})
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type,
@@ -2198,7 +2948,7 @@ export class LocalBackend {
       `;
 
       try {
-        const rows = await executeParameterized(repo.id, symbolQuery, queryParams);
+        const rows = await executeParameterized(repo.lbugPath, symbolQuery, queryParams);
         for (const sym of rows) {
           changedSymbols.push({
             id: sym.id || sym[0],
@@ -2220,7 +2970,7 @@ export class LocalBackend {
       const symNameById = new Map(changedSymbols.map((s) => [s.id, s.name]));
       try {
         const procs = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE n.id IN $ids
@@ -2288,7 +3038,7 @@ export class LocalBackend {
       dry_run?: boolean;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const { new_name, file_path } = params;
     const dry_run = params.dry_run ?? true;
@@ -2429,6 +3179,7 @@ export class LocalBackend {
         timeout: 5000,
         // Avoid ENOBUFS on large repos: rg -l can list many files.
         maxBuffer: 256 * 1024 * 1024,
+        windowsHide: true,
       });
       const files = output
         .trim()
@@ -2497,20 +3248,7 @@ export class LocalBackend {
     };
   }
 
-  private async impact(
-    repo: RepoHandle,
-    params: {
-      target: string;
-      target_uid?: string;
-      file_path?: string;
-      kind?: string;
-      direction: 'upstream' | 'downstream';
-      maxDepth?: number;
-      relationTypes?: string[];
-      includeTests?: boolean;
-      minConfidence?: number;
-    },
-  ): Promise<any> {
+  private async impact(repo: RepoHandle, params: ImpactParams): Promise<any> {
     try {
       return await this._impactImpl(repo, params);
     } catch (err: any) {
@@ -2527,21 +3265,8 @@ export class LocalBackend {
     }
   }
 
-  private async _impactImpl(
-    repo: RepoHandle,
-    params: {
-      target: string;
-      target_uid?: string;
-      file_path?: string;
-      kind?: string;
-      direction: 'upstream' | 'downstream';
-      maxDepth?: number;
-      relationTypes?: string[];
-      includeTests?: boolean;
-      minConfidence?: number;
-    },
-  ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+  private async _impactImpl(repo: RepoHandle, params: ImpactParams): Promise<any> {
+    await this.ensureInitialized(repo);
 
     const { target, direction } = params;
     const maxDepth = params.maxDepth || 3;
@@ -2606,21 +3331,121 @@ export class LocalBackend {
     }
 
     if (outcome.kind === 'ambiguous') {
+      // #2129 — a bare name that collides with several symbols must NOT report a
+      // bare `impactedCount: 0`. The real blast radius lives under whichever
+      // candidate the caller meant; a flat zero here is precisely the silent
+      // under-report the "run impact before editing" workflow exists to prevent
+      // (the dropped caller calls a *different* same-name node, so it never shows
+      // up against the one the resolver happened to pick). Run a bounded,
+      // summary-only BFS per candidate so each one's true count + risk is
+      // visible, and surface the maximum at the top level so the headline can
+      // never read as "safe to refactor". Candidates arrive sorted by score.
+      const AMBIGUOUS_MAX_CANDIDATES = 6;
+      const probed = outcome.candidates.slice(0, AMBIGUOUS_MAX_CANDIDATES);
+      // `partialProbe` is intentionally a SECOND incompleteness flag, distinct
+      // from the traversal-interrupted `partial` flag used elsewhere: it means
+      // one or more per-candidate probes threw, so maxRisk / maxImpactedCount
+      // are lower bounds over the probes that succeeded (a failed candidate must
+      // not be masked by a benign sibling success).
+      let probeFailed = false;
+      const candidateSummaries = await Promise.all(
+        probed.map(async (c) => {
+          const cType = c.type || '';
+          const cRelTypes =
+            (cType === 'Class' || cType === 'Interface') &&
+            !hasExplicitRelationTypes &&
+            !relationTypes.includes('ACCESSES')
+              ? [...relationTypes, 'ACCESSES']
+              : relationTypes;
+          // #1858/#2129 review F8 — name the shape the probe summary is read
+          // through (`_runImpactBFS` returns `Promise<any>`, so this is the
+          // narrowing cast) so a future rename of those fields fails tsc instead
+          // of silently zeroing candidate counts.
+          let summary: {
+            impactedCount: number;
+            risk: string;
+            summary?: { direct: number };
+          } | null = null;
+          try {
+            summary = await this._runImpactBFS(
+              repo,
+              { id: c.id, name: c.name, filePath: c.filePath },
+              cType,
+              direction,
+              {
+                maxDepth,
+                relationTypes: cRelTypes,
+                includeTests,
+                minConfidence,
+                summaryOnly: true,
+                skipEpistemic: true,
+                skipEnrichment: true,
+              },
+            );
+          } catch (e) {
+            probeFailed = true;
+            logQueryError('impact:ambiguous-candidate', e);
+          }
+          return {
+            uid: c.id,
+            name: c.name,
+            kind: c.type,
+            filePath: c.filePath,
+            line: c.startLine,
+            score: Number(c.score.toFixed(2)),
+            impactedCount: summary?.impactedCount ?? 0,
+            risk: summary?.risk ?? 'UNKNOWN',
+            direct: summary?.summary?.direct ?? 0,
+          };
+        }),
+      );
+
+      // Rank by blast radius so the most-impactful interpretation is first, and
+      // hoist the maximum count/risk to the top level so the response cannot be
+      // misread as "no impact".
+      candidateSummaries.sort((a, b) => b.impactedCount - a.impactedCount);
+      const maxImpactedCount = candidateSummaries.reduce((m, c) => Math.max(m, c.impactedCount), 0);
+      const RISK_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+      // If EVERY candidate probe failed (all 'UNKNOWN' — e.g. pool exhaustion
+      // under the fan-out), the worst real risk is genuinely unknown, not LOW.
+      // Reporting LOW here would re-introduce the false-safe signal. Only fall to
+      // the LOW seed when at least one candidate produced a real risk.
+      const anyKnownRisk = candidateSummaries.some((c) => RISK_ORDER.includes(c.risk));
+      const maxRisk = anyKnownRisk
+        ? candidateSummaries.reduce(
+            (worst, c) => (RISK_ORDER.indexOf(c.risk) > RISK_ORDER.indexOf(worst) ? c.risk : worst),
+            'LOW',
+          )
+        : 'UNKNOWN';
+      const truncated = outcome.candidates.length > probed.length;
+
       return {
         status: 'ambiguous',
-        message: `Found ${outcome.candidates.length} symbols matching '${target}'. Use target_uid, file_path, or kind to disambiguate.`,
+        message:
+          `Found ${outcome.candidates.length} symbols matching '${target}'` +
+          (truncated
+            ? ` (showing ${candidateSummaries.length} of ${outcome.candidates.length})`
+            : '') +
+          `. Blast radius differs per candidate (max ${maxImpactedCount} impacted at risk ${maxRisk}). ` +
+          `Disambiguate with target_uid (or file_path/kind) for a single authoritative result.`,
         target: { name: target },
         direction,
+        // Full match count — `candidates[]` is truncated to AMBIGUOUS_MAX_CANDIDATES,
+        // so consumers (CLI formatter) need this to report "N of M" honestly (#2129
+        // review F11; the CLI previously read the truncated array length).
+        totalCandidates: outcome.candidates.length,
+        // `impactedCount` stays 0 and `risk` stays UNKNOWN — there is no single
+        // resolved symbol, and UNKNOWN must NOT read as "safe to refactor". The
+        // real blast radius is surfaced per-candidate plus `maxImpactedCount` /
+        // `maxRisk` so a real caller can never hide behind the ambiguous zero
+        // (#2129).
         impactedCount: 0,
         risk: 'UNKNOWN',
-        candidates: outcome.candidates.map((c) => ({
-          uid: c.id,
-          name: c.name,
-          kind: c.type,
-          filePath: c.filePath,
-          line: c.startLine,
-          score: Number(c.score.toFixed(2)),
-        })),
+        maxImpactedCount,
+        maxRisk,
+        ...(probeFailed ? { partialProbe: true } : {}),
+        ...(truncated && { candidatesTruncated: true }),
+        candidates: candidateSummaries,
       };
     }
 
@@ -2643,7 +3468,126 @@ export class LocalBackend {
       relationTypes: effectiveRelationTypes,
       includeTests,
       minConfidence,
+      limit: Number.isFinite(params.limit) ? params.limit : 100,
+      offset: Number.isFinite(params.offset) ? params.offset : 0,
+      summaryOnly: params.summaryOnly,
     });
+  }
+
+  /**
+   * #1858 — epistemic lower-bound detection.
+   *
+   * impact()/context() traverse only edges materialized in the graph. When the
+   * queried symbol sits on an interface / abstract boundary, callers that bind
+   * to the interface via DI, a container, or dynamic dispatch — rather than
+   * naming the concrete symbol — are not traced. The reported count is then a
+   * lower bound, not an exact figure. Instead of returning a confident count
+   * that silently omits those callers, annotate the result with
+   * `epistemic: 'lower-bound'` plus a human-readable boundary note. A fully
+   * resolved leaf with no indirection stays `epistemic: 'exact'`.
+   *
+   * Aligns with the numeric confidence model rather than the long-deleted
+   * TIER_CONFIDENCE enum: the heritage/indirection edges this keys on
+   * (IMPLEMENTS / METHOD_IMPLEMENTS / EXTENDS) carry the 0.85
+   * `IMPACT_RELATION_CONFIDENCE` floor — "statically verifiable, but the
+   * concrete binding past it is not".
+   *
+   * Never throws: on query error it returns 'exact', so it can only add signal,
+   * never suppress a result.
+   */
+  private async computeEpistemicBoundary(
+    repo: RepoHandle,
+    symId: string,
+    symType: string,
+    symName: string,
+  ): Promise<{ epistemic: 'exact' | 'lower-bound'; boundaries?: string[] }> {
+    const HERITAGE_TYPES = EPISTEMIC_HERITAGE_RELATION_TYPES;
+    const CONSUMER_TYPES = EPISTEMIC_CONSUMER_RELATION_TYPES;
+    try {
+      // Discover the interface / abstract supertypes on the target's boundary.
+      // If the target is itself an interface, it is its own boundary node.
+      const boundary = new Map<string, { name: string; label: string }>();
+      if (symType === 'Interface') {
+        boundary.set(symId, { name: symName || '', label: 'Interface' });
+      }
+      const ifaceRows = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (x)-[r:CodeRelation]->(iface)
+         WHERE x.id = $symId AND r.type IN $heritage
+         RETURN DISTINCT iface.id AS id, iface.name AS name, labels(iface)[0] AS label
+         LIMIT 25`,
+        { symId, heritage: HERITAGE_TYPES },
+      ).catch(() => []);
+      for (const r of ifaceRows) {
+        const id = (r.id ?? r[0]) as string;
+        if (id && !boundary.has(id)) {
+          boundary.set(id, {
+            name: (r.name ?? r[1] ?? '') as string,
+            label: (r.label ?? r[2] ?? 'Interface') as string,
+          });
+        }
+      }
+      if (boundary.size === 0) return { epistemic: 'exact' };
+
+      const ifaceIds = Array.from(boundary.keys());
+      // Count per interface id with scalar equality. A parameterized
+      // `iface.id IN $ids` combined with `COUNT(DISTINCT ...)` + implicit
+      // group-by returns no rows under the LadybugDB cypher subset, so query
+      // each boundary node individually (boundary is small — capped at 25).
+      const countByType = async (types: readonly string[]): Promise<Map<string, number>> => {
+        const m = new Map<string, number>();
+        await Promise.all(
+          ifaceIds.map(async (ifaceId) => {
+            const rows = await executeParameterized(
+              repo.lbugPath,
+              `MATCH (other)-[r:CodeRelation]->(iface)
+               WHERE iface.id = $ifaceId AND r.type IN $types
+               RETURN COUNT(DISTINCT other.id) AS cnt`,
+              { ifaceId, types },
+            ).catch(() => []);
+            const cnt =
+              rows.length > 0 ? Number((rows[0] as any).cnt ?? (rows[0] as any)[0] ?? 0) : 0;
+            m.set(ifaceId, cnt);
+          }),
+        );
+        return m;
+      };
+      const [implCounts, consumerCounts] = await Promise.all([
+        countByType(HERITAGE_TYPES),
+        countByType(CONSUMER_TYPES),
+      ]);
+
+      const boundaries: string[] = [];
+      for (const [id, info] of boundary) {
+        const impls = implCounts.get(id) ?? 0;
+        const consumers = consumerCounts.get(id) ?? 0;
+        // Flag only a genuine indirection risk: an interface that is actually
+        // consumed (callers bind to it) or that has multiple implementations
+        // (runtime dispatch is ambiguous). A concrete type implementing an
+        // interface nothing references is fully traced → stays exact.
+        if (consumers >= 1 || impls >= 2) {
+          const label = (info.label || 'Interface').toLowerCase();
+          const name = info.name || '(unnamed)';
+          const article = /^[aeiou]/.test(label) ? 'an' : 'a';
+          const parts: string[] = [];
+          if (impls >= 1)
+            parts.push(`${impls} ${impls === 1 ? 'implementation' : 'implementations'}`);
+          if (consumers >= 1)
+            parts.push(
+              `${consumers} interface-level ${consumers === 1 ? 'consumer' : 'consumers'}`,
+            );
+          boundaries.push(
+            `${name} is ${article} ${label} with ${parts.join(' and ')}; callers that bind via the ${label} ` +
+              `(e.g. a DI container or dynamic dispatch) are not traced to the concrete symbol — ` +
+              `actual impact may be higher.`,
+          );
+        }
+      }
+      if (boundaries.length === 0) return { epistemic: 'exact' };
+      return { epistemic: 'lower-bound', boundaries };
+    } catch {
+      return { epistemic: 'exact' };
+    }
   }
 
   /**
@@ -2659,13 +3603,65 @@ export class LocalBackend {
       relationTypes: string[];
       includeTests: boolean;
       minConfidence: number;
+      limit?: number;
+      offset?: number;
+      summaryOnly?: boolean;
+      // Enrichment/annotation suppression flags (#1858/#2129 review F6). Each
+      // suppresses a distinct sub-phase; they compose, and the real call sites are:
+      //   - full impact()/context(): none set.
+      //   - group cross-repo fan-out (impactByUid): skipPerSymbolEnrichment +
+      //     skipEpistemic — the fan-out consumes only byDepth.
+      //   - ambiguous #2129 per-candidate probe: skipEpistemic + skipEnrichment —
+      //     needs only count + a count-based risk.
+      // skipPerSymbolEnrichment: drop the post-pagination per-symbol
+      //   STEP_IN_PROCESS pass (keeps byDepth).
+      // skipEpistemic: skip the #1858 interface/indirection boundary probe.
+      // skipEnrichment: skip the process/module aggregation passes entirely;
+      //   risk then derives from directCount/total only. NOTE: this also makes
+      //   skipPerSymbolEnrichment a no-op (affectedProcesses stays empty), which
+      //   is why the ambiguous probe sets only the two flags above.
+      skipPerSymbolEnrichment?: boolean;
+      skipEpistemic?: boolean;
+      skipEnrichment?: boolean;
     },
   ): Promise<any> {
     const { maxDepth, relationTypes, includeTests, minConfidence } = opts;
-    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
-    const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
+    const skipPerSymbolEnrichment = opts.skipPerSymbolEnrichment ?? false;
+    const skipEnrichment = opts.skipEnrichment ?? false;
+    const hasExplicitLimit = typeof opts.limit === 'number' && Number.isFinite(opts.limit);
+    const paginationLimit = hasExplicitLimit
+      ? Math.max(1, Math.min(Math.trunc(opts.limit!), 10000))
+      : Infinity;
+    const rawOffset =
+      typeof opts.offset === 'number' && Number.isFinite(opts.offset) ? opts.offset : 0;
+    const paginationOffset = Math.max(0, Math.trunc(rawOffset));
+    const summaryOnly = opts.summaryOnly ?? false;
+    // Bind the BFS frontier query's filters as parameters (#1907 review F5):
+    // node ids and relation types as bound lists, the confidence floor as a
+    // bound number — no string interpolation reaches the query text. Preserve
+    // the original "no confidence clause when minConfidence <= 0" behavior: an
+    // unconditional `>= 0` would wrongly exclude NULL-confidence edges that the
+    // unfiltered query includes.
+    const safeMinConfidence = Number.isFinite(minConfidence) ? minConfidence : 0;
+    const confidenceFilter = safeMinConfidence > 0 ? ' AND r.confidence >= $minConfidence' : '';
 
     const symId = sym.id || sym[0];
+
+    // #1858 — kick off the epistemic boundary probe concurrently with the BFS.
+    // It depends only on symId/symType/symName (all known now) and touches no
+    // shared state, so its extra round-trip overlaps the traversal instead of
+    // adding to the serial path. `skipEpistemic` (ambiguous #2129 candidate
+    // probes, group fan-out) resolves to no field, preserving prior behavior.
+    // #1858/#2129 review F8 — the skip case adds no field, so `epistemic` is
+    // optional here (the union's `{}` subtype). computeEpistemicBoundary's own
+    // return keeps `epistemic` REQUIRED — only this promise widens to the skip
+    // subtype.
+    const epistemicPromise: Promise<{
+      epistemic?: 'exact' | 'lower-bound';
+      boundaries?: string[];
+    }> = opts.skipEpistemic
+      ? Promise.resolve({})
+      : this.computeEpistemicBoundary(repo, symId, symType, (sym.name || sym[1]) as string);
 
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
@@ -2684,7 +3680,7 @@ export class LocalBackend {
         // Run both seed queries in parallel — they are independent.
         const [ctorRows, fileRows] = await Promise.all([
           executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (n)-[hm:CodeRelation]->(c:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
@@ -2695,7 +3691,7 @@ export class LocalBackend {
           // Restrict to DEFINES edges only — other File->Class edge types (if
           // any) should not be treated as the owning file relationship.
           executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
@@ -2721,7 +3717,7 @@ export class LocalBackend {
         }
 
         const typedPropertyRows = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (p:\`Property\`)
           WHERE p.declaredType = $name
@@ -2751,15 +3747,19 @@ export class LocalBackend {
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
 
-      // Batch frontier nodes into a single Cypher query per depth level
-      const idList = frontier.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
+      // Batch frontier nodes into a single Cypher query per depth level.
+      // ids/types/confidence are bound parameters (see above) — no interpolation.
       const query =
         direction === 'upstream'
-          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
-          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
+          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
+          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
 
       try {
-        const related = await executeQuery(repo.id, query);
+        const related = await executeParameterized(repo.lbugPath, query, {
+          frontierIds: frontier,
+          relTypes: relationTypes,
+          ...(safeMinConfidence > 0 ? { minConfidence: safeMinConfidence } : {}),
+        });
 
         for (const rel of related) {
           const relId = rel.id || rel[1];
@@ -2810,13 +3810,31 @@ export class LocalBackend {
     const directCount = (grouped[1] || []).length;
     let affectedProcesses: any[] = [];
     let affectedModules: any[] = [];
+    // Per-symbol process membership: maps impacted symbol id -> list of processes
+    // it participates in. Populated by a second chunked Cypher pass below when
+    // any process is affected at all. Surfaced as `processes: [...]` on each
+    // byDepth item so consumers can tell which caller belongs to which cron/
+    // webhook/route without a follow-up query.
+    const perSymbolProcesses = new Map<
+      string,
+      Array<{ id: string; label: string; processType: string; step: number }>
+    >();
 
-    if (impacted.length > 0) {
-      const CHUNK_SIZE = 100;
-      // Max number of chunks to process to avoid unbounded DB round-trips.
-      // Configurable via env IMPACT_MAX_CHUNKS, default 10 => max items = 1000
-      const MAX_CHUNKS = parseInt(process.env.IMPACT_MAX_CHUNKS || '10', 10);
+    // Chunking bounds for batched DB round-trips. Declared at function scope so
+    // both the in-block enrichment passes and the post-pagination per-symbol
+    // process enrichment can reference them.
+    const CHUNK_SIZE = 100;
+    // Max number of chunks to process to avoid unbounded DB round-trips.
+    // Configurable via env IMPACT_MAX_CHUNKS, default 10 => max items = 1000
+    const MAX_CHUNKS = parseInt(process.env.IMPACT_MAX_CHUNKS || '10', 10);
 
+    // `skipEnrichment` (ambiguous #2129 per-candidate probes) bypasses the
+    // process/module aggregation passes entirely — those probes need only the
+    // count + a count-based risk, so paying the bounded-but-real enrichment cost
+    // ~6× per ambiguous call is wasted. risk then derives from directCount /
+    // total only (processCount/moduleCount stay 0), an acceptable approximation
+    // for a disambiguation aid.
+    if (impacted.length > 0 && !skipEnrichment) {
       // ── Process enrichment: batched chunking (bounded by MAX_CHUNKS) ─
       // Uses merged Cypher query (WITH + OPTIONAL MATCH) to fetch
       // process + entry point info in 1 round-trip per chunk. Converted to
@@ -2850,7 +3868,7 @@ export class LocalBackend {
         try {
           // Use parameterized list to avoid building long query strings
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
             WHERE s.id IN $ids
@@ -2924,7 +3942,7 @@ export class LocalBackend {
           const pIds = Array.from(processesMissingMinStep);
           const allImpactedIds = impacted.map((it) => String(it.id ?? ''));
           const missingRows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
             WHERE p.id IN $pIds AND s.id IN $ids
@@ -2962,6 +3980,10 @@ export class LocalBackend {
         }))
         .sort((a, b) => b.total_hits - a.total_hits);
 
+      // Per-symbol process membership is populated post-pagination (see below)
+      // so it covers exactly the symbols returned in byDepth, not a pre-capped
+      // flat slice that could miss depth-2+ symbols when depth-1 is large.
+
       // ── Module enrichment: use same cap as process enrichment and parameterized queries
       const maxItems = Math.min(impacted.length, MAX_CHUNKS * CHUNK_SIZE);
       const cappedImpacted = impacted.slice(0, maxItems);
@@ -2980,7 +4002,7 @@ export class LocalBackend {
         if (!idsChunk || idsChunk.length === 0) return;
         try {
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
             WHERE s.id IN $ids
@@ -3013,7 +4035,7 @@ export class LocalBackend {
         if (!idsChunk || idsChunk.length === 0) return;
         try {
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
             WHERE s.id IN $ids
@@ -3073,7 +4095,17 @@ export class LocalBackend {
       risk = 'MEDIUM';
     }
 
-    return {
+    // Build per-depth counts (always included, even in summaryOnly mode)
+    const byDepthCounts: Record<number, number> = {};
+    for (const [depth, items] of Object.entries(grouped)) {
+      byDepthCounts[Number(depth)] = items.length;
+    }
+
+    // #1858 — await the epistemic boundary probe kicked off alongside the BFS
+    // above. Additive: leaves impactedCount and every existing field untouched.
+    const epistemic = await epistemicPromise;
+
+    const base = {
       target: {
         id: symId,
         name: sym.name || sym[1],
@@ -3083,15 +4115,118 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      ...epistemic,
       ...(!traversalComplete && { partial: true }),
       summary: {
         direct: directCount,
         processes_affected: processCount,
         modules_affected: moduleCount,
       },
+      byDepthCounts,
       affected_processes: affectedProcesses,
       affected_modules: affectedModules,
-      byDepth: grouped,
+    };
+
+    if (summaryOnly) {
+      return base;
+    }
+
+    // Apply limit/offset pagination per depth level.
+    const paginatedGrouped: Record<number, any[]> = {};
+    let anyTruncated = false;
+    for (const [depth, items] of Object.entries(grouped)) {
+      const total = items.length;
+      const sliced = items.slice(paginationOffset, paginationOffset + paginationLimit);
+      paginatedGrouped[Number(depth)] = sliced;
+      if (paginationOffset > 0 || paginationOffset + paginationLimit < total) {
+        anyTruncated = true;
+      }
+    }
+
+    // ── Per-symbol process membership enrichment (post-pagination) ───────
+    // Runs after paginatedGrouped is built so we enrich only the IDs that
+    // actually appear in the response. This eliminates the false-empty
+    // processes:[] case where a depth-2+ symbol's flat position in `impacted`
+    // exceeded MAX_CHUNKS*CHUNK_SIZE even though it is returned by byDepth.
+    // Also uses DISTINCT + MIN(r.step) per (symbol, process) pair to avoid
+    // duplicate entries when a symbol has multiple STEP_IN_PROCESS edges.
+    // Skipped entirely when `skipPerSymbolEnrichment` is set (group cross-repo
+    // fan-out, which consumes byDepth but not byDepth[].processes); the
+    // attach-loop below still stamps an empty processes:[] for shape stability.
+    let perSymbolEnrichmentCapped = false;
+    if (affectedProcesses.length > 0 && !skipPerSymbolEnrichment) {
+      // Collect unique IDs from the paginated result in one pass.
+      const pageIds = new Set<string>();
+      for (const items of Object.values(paginatedGrouped)) {
+        for (const it of items) {
+          const id = String(it.id ?? '');
+          if (id) pageIds.add(id);
+        }
+      }
+      // Bound the enrichment to the same ceiling as the aggregation pass
+      // (MAX_CHUNKS * CHUNK_SIZE) so a large paginated page cannot trigger
+      // unbounded DB round-trips (DoD 2.6). When capped, mark the result
+      // partial so callers know some returned symbols may carry an empty
+      // processes:[] that is a cap artifact, not a true absence.
+      const maxPageIds = MAX_CHUNKS * CHUNK_SIZE;
+      let pageIdArr = Array.from(pageIds);
+      if (pageIdArr.length > maxPageIds) {
+        pageIdArr = pageIdArr.slice(0, maxPageIds);
+        perSymbolEnrichmentCapped = true;
+      }
+      for (let i = 0; i < pageIdArr.length; i += CHUNK_SIZE) {
+        const chunkIds = pageIdArr.slice(i, i + CHUNK_SIZE);
+        try {
+          const rows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+            WHERE s.id IN $ids
+            RETURN s.id AS sid, p.id AS pid, p.heuristicLabel AS pName,
+                   p.processType AS pType, MIN(r.step) AS step
+          `,
+            { ids: chunkIds },
+          ).catch(() => []);
+          for (const row of rows) {
+            const sid = row.sid ?? row[0];
+            if (!sid) continue;
+            const procEntry = {
+              id: String(row.pid ?? row[1] ?? ''),
+              label: String(row.pName ?? row[2] ?? ''),
+              processType: String(row.pType ?? row[3] ?? ''),
+              step: Number(row.step ?? row[4] ?? -1),
+            };
+            const list = perSymbolProcesses.get(String(sid));
+            if (list) list.push(procEntry);
+            else perSymbolProcesses.set(String(sid), [procEntry]);
+          }
+        } catch (e) {
+          logQueryError('impact:per-symbol-process-chunk', e);
+        }
+      }
+    }
+
+    // Attach processes field to each paginated item.
+    for (const items of Object.values(paginatedGrouped)) {
+      for (const it of items) {
+        it.processes = perSymbolProcesses.get(String(it.id)) ?? [];
+      }
+    }
+
+    return {
+      ...base,
+      // Surface partial if the per-symbol enrichment was capped, even when the
+      // BFS traversal itself completed — some returned symbols may carry an
+      // empty processes:[] that is a cap artifact rather than a true absence.
+      ...(perSymbolEnrichmentCapped && { partial: true }),
+      ...(anyTruncated && {
+        pagination: {
+          ...(Number.isFinite(paginationLimit) && { limit: paginationLimit }),
+          offset: paginationOffset,
+          truncated: true,
+        },
+      }),
+      byDepth: paginatedGrouped,
     };
   }
 
@@ -3116,22 +4251,24 @@ export class LocalBackend {
     // scope — the caller's Promise.race against the same signal
     // resolves the await regardless of how long this body runs.
     if (opts.signal?.aborted) return null;
+    let repo: RepoHandle | undefined;
     try {
       await this.refreshRepos();
-      await this.ensureInitialized(repoId);
+      // Fetch the resolved handle BEFORE init and pass it through, so a
+      // concurrent refresh can't remap the id to a different clone (#2067).
+      repo = this.repos.get(repoId);
+      if (repo) await this.ensureInitialized(repo);
     } catch {
       return null;
     }
-
-    const repo = this.repos.get(repoId);
-    if (!repo) return null;
+    if (!repo) return null; // unknown repo → null (preserves contract)
 
     const dir: 'upstream' | 'downstream' = direction === 'downstream' ? 'downstream' : 'upstream';
 
     let rows: any[];
     try {
       rows = await executeParameterized(
-        repoId,
+        repo.lbugPath, // pool keyed by the resolved clone's path, not the id
         `MATCH (n) WHERE n.id = $uid
          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, labels(n)[0] AS type
          LIMIT 1`,
@@ -3177,11 +4314,24 @@ export class LocalBackend {
           ];
 
     try {
+      // skipPerSymbolEnrichment suppresses ONLY the per-symbol STEP_IN_PROCESS
+      // enrichment pass while preserving byDepth. Group-mode cross-repo fan-out
+      // may fan across many repos; the per-symbol pass adds up to MAX_CHUNKS
+      // extra round-trips per repo, which is unacceptable at group scale. But
+      // cross-impact fan-out DOES consume byDepth (cross-impact.ts reads
+      // fan.byDepth to populate group by_depth), so summaryOnly would wrongly
+      // drop it. Group callers do not consume byDepth[].processes, so skipping
+      // only that enrichment is the correct, targeted suppression.
       return await this._runImpactBFS(repo, sym, symType, dir, {
         maxDepth: opts.maxDepth,
         relationTypes,
         includeTests: opts.includeTests,
         minConfidence: opts.minConfidence,
+        skipPerSymbolEnrichment: true,
+        // Group cross-repo fan-out consumes only byDepth (cross-impact.ts), not
+        // the #1858 epistemic/boundaries fields — computing them per neighbor is
+        // dead work on the highest-volume path, so suppress them here too.
+        skipEpistemic: true,
       });
     } catch {
       return null;
@@ -3245,6 +4395,9 @@ export class LocalBackend {
       if (typeof params.subgroup === 'string') impactArgs.subgroup = params.subgroup;
       if (params.timeoutMs !== undefined) impactArgs.timeoutMs = params.timeoutMs;
       if (params.timeout !== undefined) impactArgs.timeout = params.timeout;
+      // limit/offset/summaryOnly are not forwarded to group-mode impact:
+      // runGroupImpact uses GROUP_LOCAL_PHASE_LIMIT internally for UID
+      // collection and does not re-paginate the local result yet.
       return svc.groupImpact(impactArgs);
     }
     if (method === 'query') {
@@ -3489,11 +4642,11 @@ export class LocalBackend {
   }
 
   private async routeMap(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     if (routes.length === 0) {
       return {
@@ -3506,7 +4659,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.id,
+      repo.lbugPath,
       routes.map((r) => r.id),
     );
 
@@ -3523,11 +4676,11 @@ export class LocalBackend {
   }
 
   private async shapeCheck(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const allRoutes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     const results = allRoutes
       .filter(
@@ -3605,13 +4758,13 @@ export class LocalBackend {
   }
 
   private async toolMap(repo: RepoHandle, params: { tool?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const toolFilter = params.tool ? `AND n.name CONTAINS $tool` : '';
     const queryParams = params.tool ? { tool: params.tool } : {};
 
     const rows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n:Tool)
       WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
@@ -3629,7 +4782,7 @@ export class LocalBackend {
     }
 
     const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, toolIds);
+    const flowMap = await this.fetchLinkedFlowsBatch(repo.lbugPath, toolIds);
 
     return {
       tools: rows.map((r: any) => {
@@ -3649,7 +4802,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { route?: string; file?: string },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     if (!params.route && !params.file) {
       return { error: 'Either "route" or "file" parameter is required.' };
@@ -3667,7 +4820,7 @@ export class LocalBackend {
       queryParams.file = params.file;
     }
 
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     if (routes.length === 0) {
       const target = params.route || params.file;
@@ -3675,7 +4828,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.id,
+      repo.lbugPath,
       routes.map((r) => r.id),
     );
 
@@ -3801,12 +4954,12 @@ export class LocalBackend {
    */
   async queryClusters(repoName?: string, limit = 100): Promise<{ clusters: any[] }> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     try {
       const rawLimit = Math.max(limit * 5, 200);
       const clusters = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (c:Community)
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -3833,11 +4986,11 @@ export class LocalBackend {
    */
   async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     try {
       const processes = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (p:Process)
         RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -3865,10 +5018,10 @@ export class LocalBackend {
    */
   async queryClusterDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const clusters = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -3895,7 +5048,7 @@ export class LocalBackend {
     }
 
     const members = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -3928,10 +5081,10 @@ export class LocalBackend {
    */
   async queryProcessDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const processes = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (p:Process)
       WHERE p.label = $processName OR p.heuristicLabel = $processName
@@ -3945,7 +5098,7 @@ export class LocalBackend {
     const proc = processes[0];
     const procId = proc.id || proc[0];
     const steps = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
       RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step

@@ -182,32 +182,9 @@ const LABEL_BEHAVIOR = {
   Section: 'inert',
   Route: 'inert',
   Tool: 'inert',
-  // Spring Boot / Enterprise Java node types
-  Bean: 'inert',
-  ConfigProperty: 'inert',
-  KafkaTopic: 'inert',
-  KafkaConsumer: 'inert',
-  KafkaProducer: 'inert',
-  // Plugin-extensible node types
-  KafkaConfig: 'inert',
-  KafkaTopics: 'inert',
-  JpaEntity: 'inert',
-  JpaRepository: 'inert',
-  JpaField: 'inert',
-  MyBatisMapper: 'inert',
-  MyBatisXmlMapper: 'inert',
-  MyBatisSql: 'inert',
-  MyBatisMethod: 'inert',
-  // Markdown node types
-  MarkdownDoc: 'inert',
-  MarkdownHeading: 'inert',
-  CodeBlock: 'inert',
-  Link: 'inert',
-  Image: 'inert',
-  Todo: 'inert',
-  Table: 'inert',
-  Blockquote: 'inert',
-  List: 'inert',
+  // Taint/PDG substrate (issue #2080) — a control-flow node, never a
+  // symbol-resolution target. Inert: file index only, no owner scope.
+  BasicBlock: 'inert',
 } as const satisfies Record<NodeLabel, LabelBehavior> &
   // Cross-invariant 1 — every class-like label (participates in
   // qualifiedName fallback in `SymbolTable.add()`) MUST be classified as

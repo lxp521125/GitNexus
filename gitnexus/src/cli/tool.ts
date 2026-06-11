@@ -16,8 +16,9 @@
  */
 
 import { writeSync } from 'node:fs';
-import { LocalBackend } from '../mcp/local/local-backend.js';
-import { cliError } from './cli-message.js';
+import { LocalBackend, VALID_NODE_LABELS } from '../mcp/local/local-backend.js';
+import { cliErrorKey, cliWarnKey } from './cli-message.js';
+import { formatDetectChangesResult } from './detect-changes-format.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -26,7 +27,7 @@ async function getBackend(): Promise<LocalBackend> {
   _backend = new LocalBackend();
   const ok = await _backend.init();
   if (!ok) {
-    cliError('GitNexus: No indexed repositories found. Run: gitnexus analyze');
+    cliErrorKey('tool.noIndexed');
     process.exit(1);
   }
   return _backend;
@@ -61,6 +62,7 @@ export async function queryCommand(
   queryText: string,
   options?: {
     repo?: string;
+    branch?: string;
     context?: string;
     goal?: string;
     limit?: string;
@@ -68,7 +70,7 @@ export async function queryCommand(
   },
 ): Promise<void> {
   if (!queryText?.trim()) {
-    cliError('Usage: gitnexus query <search_query>');
+    cliErrorKey('tool.usage.query');
     process.exit(1);
   }
 
@@ -80,6 +82,7 @@ export async function queryCommand(
     limit: options?.limit ? parseInt(options.limit) : undefined,
     include_content: options?.content ?? false,
     repo: options?.repo,
+    branch: options?.branch,
   });
   output(result);
 }
@@ -88,13 +91,19 @@ export async function contextCommand(
   name: string,
   options?: {
     repo?: string;
+    branch?: string;
     file?: string;
     uid?: string;
     content?: boolean;
   },
 ): Promise<void> {
+  // Reject a `--`-prefixed uid swallowed from a following flag (see impactCommand).
+  if (options?.uid?.startsWith('--')) {
+    cliErrorKey('tool.usage.context');
+    process.exit(1);
+  }
   if (!name?.trim() && !options?.uid) {
-    cliError('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
+    cliErrorKey('tool.usage.context');
     process.exit(1);
   }
 
@@ -105,32 +114,66 @@ export async function contextCommand(
     file_path: options?.file,
     include_content: options?.content ?? false,
     repo: options?.repo,
+    branch: options?.branch,
   });
   output(result);
 }
 
 export async function impactCommand(
-  target: string,
+  target?: string,
   options?: {
     direction?: string;
     repo?: string;
+    branch?: string;
+    uid?: string;
+    file?: string;
+    kind?: string;
     depth?: string;
     includeTests?: boolean;
+    limit?: string;
+    offset?: string;
+    summaryOnly?: boolean;
   },
 ): Promise<void> {
-  if (!target?.trim()) {
-    cliError('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
+  // A `--`-prefixed uid means Commander swallowed a following flag as the uid
+  // value (e.g. `impact --uid --file x` → uid === '--file'). Reject it rather
+  // than forwarding a garbage uid that would silently resolve to not-found.
+  if (options?.uid?.startsWith('--')) {
+    cliErrorKey('tool.usage.impact');
     process.exit(1);
+  }
+  // Target is an optional positional: a uid alone is enough to resolve (parity
+  // with `context [name]`). Only error when neither a target nor a uid is given.
+  if (!target?.trim() && !options?.uid) {
+    cliErrorKey('tool.usage.impact');
+    process.exit(1);
+  }
+  // Soft-validate --kind: an unknown kind is a no-op hint (the backend scores
+  // it but it matches nothing), so warn and proceed rather than rejecting —
+  // parity with the lenient MCP surface and forward-compatible with new labels.
+  if (options?.kind && !VALID_NODE_LABELS.has(options.kind)) {
+    cliWarnKey('tool.warn.unknownKind', { kind: options.kind });
   }
 
   try {
     const backend = await getBackend();
+    const rawLimit = parseInt(options?.limit ?? '', 10);
+    const rawOffset = parseInt(options?.offset ?? '', 10);
+    const parsedLimit = Number.isFinite(rawLimit) ? rawLimit : undefined;
+    const parsedOffset = Number.isFinite(rawOffset) ? rawOffset : undefined;
     const result = await backend.callTool('impact', {
-      target,
+      target: target || undefined,
+      target_uid: options?.uid,
+      file_path: options?.file,
+      kind: options?.kind,
       direction: options?.direction || 'upstream',
       maxDepth: options?.depth ? parseInt(options.depth, 10) : undefined,
       includeTests: options?.includeTests ?? false,
       repo: options?.repo,
+      branch: options?.branch,
+      limit: parsedLimit,
+      offset: parsedOffset,
+      summaryOnly: options?.summaryOnly ?? undefined,
     });
     output(result);
   } catch (err: unknown) {
@@ -151,10 +194,11 @@ export async function cypherCommand(
   query: string,
   options?: {
     repo?: string;
+    branch?: string;
   },
 ): Promise<void> {
   if (!query?.trim()) {
-    cliError('Usage: gitnexus cypher <cypher_query>');
+    cliErrorKey('tool.usage.cypher');
     process.exit(1);
   }
 
@@ -162,58 +206,23 @@ export async function cypherCommand(
   const result = await backend.callTool('cypher', {
     query,
     repo: options?.repo,
+    branch: options?.branch,
   });
   output(result);
-}
-
-function formatDetectChangesResult(result: any): string {
-  if (result?.error) return `Error: ${result.error}`;
-
-  const summary = result?.summary || {};
-  if ((summary.changed_count || 0) === 0) {
-    return 'No changes detected.';
-  }
-
-  const lines: string[] = [];
-  lines.push(`Changes: ${summary.changed_files || 0} files, ${summary.changed_count || 0} symbols`);
-  lines.push(`Affected processes: ${summary.affected_count || 0}`);
-  lines.push(`Risk level: ${summary.risk_level || 'unknown'}`);
-  lines.push('');
-
-  const changed = result?.changed_symbols || [];
-  if (changed.length > 0) {
-    lines.push('Changed symbols:');
-    for (const symbol of changed.slice(0, 15)) {
-      lines.push(`  ${symbol.type} ${symbol.name} → ${symbol.filePath}`);
-    }
-    if (changed.length > 15) {
-      lines.push(`  ... and ${changed.length - 15} more`);
-    }
-    lines.push('');
-  }
-
-  const affected = result?.affected_processes || [];
-  if (affected.length > 0) {
-    lines.push('Affected execution flows:');
-    for (const processInfo of affected.slice(0, 10)) {
-      const steps = (processInfo.changed_steps || []).map((s: any) => s.symbol).join(', ');
-      lines.push(`  • ${processInfo.name} (${processInfo.step_count} steps) — changed: ${steps}`);
-    }
-  }
-
-  return lines.join('\n').trim();
 }
 
 export async function detectChangesCommand(options?: {
   scope?: string;
   baseRef?: string;
   repo?: string;
+  branch?: string;
 }): Promise<void> {
   const backend = await getBackend();
   const result = await backend.callTool('detect_changes', {
     scope: options?.scope || 'unstaged',
     base_ref: options?.baseRef,
     repo: options?.repo,
+    branch: options?.branch,
   });
   output(formatDetectChangesResult(result));
 }
