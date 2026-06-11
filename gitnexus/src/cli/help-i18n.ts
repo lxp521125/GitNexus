@@ -208,10 +208,13 @@ function applyHelpI18n(command: Command, commandPath = ''): void {
   if (descriptionKey) command.description(t(descriptionKey));
 
   command.helpOption('-h, --help', t('help.option.help'));
+  // commander 12.1.0 runtime supports styleTitle/optionDescription but the
+  // bundled type definitions are missing styleTitle.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   command.configureHelp({
     styleTitle: localizeTitle,
     optionDescription: localizeOptionDescription,
-  });
+  } as any);
 
   if (command.commands.length > 0) {
     command.helpCommand('help [command]', t('help.command.help.description'));
