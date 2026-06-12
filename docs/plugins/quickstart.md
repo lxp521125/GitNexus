@@ -38,7 +38,7 @@ Create `package.json`:
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../gitnexus-shared"
+    "gitnexus-shared": "*"
   }
 }
 ```
@@ -155,12 +155,12 @@ export default new HelloParserPlugin();
 ## Step 4: Build the Plugin
 
 ```bash
-# Install dependencies (using npm link or file: protocol)
-cd ../gitnexus-shared && npm run build && npm link
-cd ../gitnexus-hello-plugin
-npm link gitnexus-shared
+# Install dependencies from the repo root (npm workspaces)
+cd ../../   # Go to the repo root (GitNexus/)
+npm install
 
 # Build the plugin
+cd gitnexus-plugins/gitnexus-hello-plugin
 npm run build
 ```
 
@@ -299,4 +299,4 @@ A: Set the environment variable `GITNEXUS_DEBUG=1` and check the logs.
 A: Yes, just add them to the `dependencies` in your `package.json`.
 
 **Q: How to reference gitnexus-shared?**
-A: In the `gitnexus-plugins/` directory, use `"gitnexus-shared": "file:../gitnexus-shared"`, or first do `cd gitnexus-shared && npm link`, then in the plugin directory `npm link gitnexus-shared`.
+A: Use `"gitnexus-shared": "*"` in your plugin's `package.json`. GitNexus uses npm workspaces, so `npm install` at the repo root links everything automatically. No manual `file:` paths or `npm link` needed.

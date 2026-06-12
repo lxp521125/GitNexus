@@ -42,21 +42,32 @@ cd /path/to/your/plugin
 npm install
 ```
 
-### 2. Dependency Version Conflicts
+### 2. Dependency Resolution (`gitnexus-shared` not found)
 
 **Symptoms**:
 ```
-Error: Cannot find module 'gitnexus-shared'
+Error: Cannot find package 'gitnexus-shared'
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'gitnexus-shared'
 ```
+
+**Root Cause**: The plugin cannot resolve `gitnexus-shared`. This usually happens when npm workspaces are not properly linked.
 
 **Solutions**:
 
 ```bash
-# Check gitnexus-shared version
-npm list gitnexus-shared
+# 1. Make sure the plugin uses the workspace reference in package.json
+#    "dependencies": { "gitnexus-shared": "*" }  (NOT "file:...")
 
-# Install correct version
-npm install gitnexus-shared@^1.0.0
+# 2. Run npm install from the repo root to link all workspaces
+cd /path/to/GitNexus   # repo root
+npm install
+
+# 3. Verify the symlink exists
+ls -la node_modules/gitnexus-shared
+# Should show: gitnexus-shared -> ../gitnexus-shared
+
+# 4. Verify the root package.json includes the workspaces
+#    "workspaces": ["gitnexus-shared", "gitnexus-plugins/*"]
 ```
 
 ### 3. TypeScript Compilation Errors

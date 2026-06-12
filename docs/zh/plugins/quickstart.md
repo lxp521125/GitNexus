@@ -38,7 +38,7 @@ npm init -y
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../gitnexus-shared"
+    "gitnexus-shared": "*"
   }
 }
 ```
@@ -155,12 +155,12 @@ export default new HelloParserPlugin();
 ## 第四步：构建插件
 
 ```bash
-# 安装依赖（使用 npm link 或 file: 协议）
-cd ../gitnexus-shared && npm run build && npm link
-cd ../gitnexus-hello-plugin
-npm link gitnexus-shared
+# 从仓库根目录安装依赖（npm workspaces）
+cd ../../   # 回到仓库根目录（GitNexus/）
+npm install
 
 # 构建插件
+cd gitnexus-plugins/gitnexus-hello-plugin
 npm run build
 ```
 
@@ -299,4 +299,4 @@ A: 设置环境变量 `GITNEXUS_DEBUG=1` 并查看日志
 A: 可以，只需在 package.json 的 dependencies 中添加即可。
 
 **Q: 如何引用 gitnexus-shared？**
-A: 在 `gitnexus-plugins/` 目录下，使用 `"gitnexus-shared": "file:../gitnexus-shared"`，或先 `cd gitnexus-shared && npm link`，然后在插件目录 `npm link gitnexus-shared`。
+A: 在插件的 `package.json` 中使用 `"gitnexus-shared": "*"`。GitNexus 已配置 npm workspaces，只需在仓库根目录执行 `npm install` 即可自动链接。无需手动配置 `file:` 路径或使用 `npm link`。

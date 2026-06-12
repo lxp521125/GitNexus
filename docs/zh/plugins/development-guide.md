@@ -72,24 +72,18 @@ gitnexus-my-plugin/
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../gitnexus-shared"
+    "gitnexus-shared": "*"
   }
 }
 ```
 
-**注意**：从 `gitnexus-plugins/` 目录，使用 `"file:../gitnexus-shared"` 指向同级目录的 `gitnexus-shared`。
+**注意**：GitNexus 使用 **npm workspaces** 管理插件依赖。根目录 `package.json` 将 `gitnexus-shared` 和 `gitnexus-plugins/*` 声明为工作区。只需在插件的 `package.json` 中使用 `"gitnexus-shared": "*"`，npm 会自动解析并链接正确的版本。无需手动配置 `file:` 路径或使用 `npm link`。
 
-或者使用 `npm link` 方式：
+创建插件后，**从仓库根目录**（而非插件目录）运行 `npm install` 完成链接：
 
 ```bash
-# 先在 gitnexus-shared 目录
-cd gitnexus-shared
-npm run build
-npm link
-
-# 然后在插件目录
-cd ../gitnexus-plugins/your-plugin
-npm link gitnexus-shared
+cd /path/to/GitNexus   # 仓库根目录
+npm install
 ```
 
 ### 3.4 tsconfig.json 配置#
@@ -723,13 +717,13 @@ async dispose(): Promise<void> {
 
 ### 13.1 插件加载失败#
 
-**问题**：插件加载时出现 `Module not found` 错误
+**问题**：插件加载时出现 `Module not found` 错误，特别是 `Cannot find package 'gitnexus-shared'`
 
 **解决方案**：
-- 检查插件依赖是否安装
-- 确保插件路径正确
+- 确保从**仓库根目录**运行了 `npm install`，以便 npm workspaces 创建正确的软链接
+- 检查插件 `package.json` 是否使用 `"gitnexus-shared": "*"`（而非 `file:` 路径）
+- 检查根目录 `package.json` 的 `workspaces` 数组是否包含 `"gitnexus-plugins/*"`
 - 验证 Node.js 版本兼容性
-- 使用 `npm link` 或 `file:` 协议正确引用 `gitnexus-shared`
 
 ### 13.2 解析性能问题#
 

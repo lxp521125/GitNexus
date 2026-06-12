@@ -717,13 +717,13 @@ async dispose(): Promise<void> {
 
 ### 13.1 Plugin Loading Failure
 
-**Problem**: `Module not found` error when loading a plugin
+**Problem**: `Module not found` error when loading a plugin, especially `Cannot find package 'gitnexus-shared'`
 
 **Solutions**:
-- Check if plugin dependencies are installed
-- Ensure the plugin path is correct
+- Ensure you ran `npm install` **from the repo root** so npm workspaces create the correct symlinks
+- Verify your plugin's `package.json` uses `"gitnexus-shared": "*"` (not a `file:` path)
+- Check the root `package.json` includes `"gitnexus-plugins/*"` in the `workspaces` array
 - Verify Node.js version compatibility
-- Use `npm link` or `file:` protocol to correctly reference `gitnexus-shared`
 
 ### 13.2 Parsing Performance Issues
 

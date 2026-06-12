@@ -42,21 +42,32 @@ cd /path/to/your/plugin
 npm install
 ```
 
-### 2. 依赖版本冲突
+### 2. 依赖解析（找不到 gitnexus-shared）
 
 **症状**：
 ```
-Error: Cannot find module 'gitnexus-shared'
+Error: Cannot find package 'gitnexus-shared'
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'gitnexus-shared'
 ```
+
+**根本原因**：插件无法解析 `gitnexus-shared`。通常是因为 npm workspaces 未正确链接。
 
 **解决方案**：
 
 ```bash
-# 检查 gitnexus-shared 版本
-npm list gitnexus-shared
+# 1. 确保插件的 package.json 使用 workspace 引用
+#    "dependencies": { "gitnexus-shared": "*" }  （而不是 "file:..."）
 
-# 安装正确版本
-npm install gitnexus-shared@^1.0.0
+# 2. 从仓库根目录运行 npm install 链接所有工作区
+cd /path/to/GitNexus   # 仓库根目录
+npm install
+
+# 3. 验证软链接是否存在
+ls -la node_modules/gitnexus-shared
+# 应显示：gitnexus-shared -> ../gitnexus-shared
+
+# 4. 检查根 package.json 是否包含 workspaces 配置
+#    "workspaces": ["gitnexus-shared", "gitnexus-plugins/*"]
 ```
 
 ### 3. TypeScript 编译错误
