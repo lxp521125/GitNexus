@@ -1,6 +1,10 @@
 {
   "name": "gitnexus-monorepo",
   "private": true,
+  "workspaces": [
+    "gitnexus-shared",
+    "gitnexus-plugins/*"
+  ],
   "scripts": {
     "prepare": "husky",
     "format": "prettier --write .",

@@ -11,6 +11,6 @@
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../../../gitnexus-shared"
+    "gitnexus-shared": "*"
   }
 }

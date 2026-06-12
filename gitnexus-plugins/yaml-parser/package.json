@@ -11,7 +11,7 @@
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../../gitnexus-shared",
+    "gitnexus-shared": "*",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {

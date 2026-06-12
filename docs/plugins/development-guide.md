@@ -72,24 +72,18 @@ gitnexus-my-plugin/
     "build": "tsc"
   },
   "dependencies": {
-    "gitnexus-shared": "file:../gitnexus-shared"
+    "gitnexus-shared": "*"
   }
 }
 ```
 
-**Note**: From the `gitnexus-plugins/` directory, use `"file:../gitnexus-shared"` to point to the sibling `gitnexus-shared` directory.
+**Note**: GitNexus uses **npm workspaces** to manage plugin dependencies. The root `package.json` declares `gitnexus-shared` and `gitnexus-plugins/*` as workspaces. Use `"gitnexus-shared": "*"` in your plugin's `package.json` — npm will automatically resolve and link the correct version. No manual `file:` paths or `npm link` needed.
 
-Or use `npm link`:
+After creating the plugin, run `npm install` **from the repo root** (not the plugin directory) to link everything:
 
 ```bash
-# First in the gitnexus-shared directory
-cd gitnexus-shared
-npm run build
-npm link
-
-# Then in the plugins directory
-cd ../gitnexus-plugins/your-plugin
-npm link gitnexus-shared
+cd /path/to/GitNexus   # repo root
+npm install
 ```
 
 ### 3.4 tsconfig.json Configuration

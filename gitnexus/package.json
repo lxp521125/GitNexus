@@ -41,7 +41,7 @@
   "scripts": {
     "build": "node scripts/build.js",
     "serve": "tsx src/cli/index.ts serve",
-    "dev": "tsx watch src/cli/index.ts",
+    "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
     "pretest:integration": "node scripts/build.js",
